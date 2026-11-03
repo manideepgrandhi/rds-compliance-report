@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2034  # checks are eval-ed strings
+# Offline tests: mock aws CLI + fixtures, shellcheck, headless Chrome (optional). Usage: bash tests/run_tests.sh
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(dirname "$HERE")"; S="$ROOT/rds_compliance_report.sh"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+PASS=0; FAIL=0
+ok() { if eval "$2"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); echo "  FAIL: $1"; fi; }
+export RDS_CR_NOW=1793700000 MOCK_NOW=1793700000 RDS_CR_NO_WAIT_N=1
+MPATH="$HERE/mock:$PATH"
+col() { jq -Rr --arg id "$2" --arg a "${3:-111111111111}" --argjson c "$4" 'sub("^\ufeff";"")|sub("\r$";"")|[splits(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")|ltrimstr("\"")|rtrimstr("\"")]|select(.[5]==$id and .[0]==$a)|.[$c]' "$1"; }
+run() { "$S" "$@" >"$T/out" 2>"$T/err"; echo $? >"$T/rc"; }
+rc() { cat "$T/rc"; }
+
+echo "== usage"
+run --version; ok "--version" '[[ $(rc) == 0 ]] && grep -q "1.0.0" "$T/out"'
+run; ok "no mode -> 1" '[[ $(rc) == 1 ]]'
+run --merge "$HERE/fixtures"; ok "merge without -o -> 1" '[[ $(rc) == 1 ]]'
+run --bogus; ok "unknown option -> 1" '[[ $(rc) == 1 ]]'
+
+echo "== merge fixtures"
+mkdir -p "$T/fakeaws"; printf '#!/bin/sh\necho "$@" >>"%s/awscalls"; exit 1\n' "$T" >"$T/fakeaws/aws"; chmod +x "$T/fakeaws/aws"
+O="$T/out dir"; PATH="$T/fakeaws:$PATH" run --merge "$HERE/fixtures" -o "$O"
+ok "merge exit 0" '[[ $(rc) == 0 ]]'
+ok "0 aws calls" '[[ ! -e "$T/awscalls" ]]'
+ok "6 outputs, N_accounts name" '[[ $(ls "$O" | grep -c "^rds_compliance_report_2_accounts_20261103_100000") == 6 ]]'
+SV="$(ls "$O"/*_servers.csv)"; AC="$(ls "$O"/*_accounts.csv)"; TX="$(ls "$O"/*.txt)"; H="$(ls "$O"/*.html)"
+ok "32 servers" '[[ $(( $(wc -l <"$SV") - 1 )) == 32 ]]'
+ok "summary 58.6% / 40%" 'grep -q "58.6%" "$TX" && grep -q "40%" "$TX"'
+ok "account 111 61.5/44" 'grep -q "\"111111111111\",.*,\"28\",\"61.5\",.*\"44\"" "$AC"'
+ok "account 222 33.3/0" 'grep -q "\"222222222222\",.*,\"4\",\"33.3\",.*,\"0\",\"0\",\"0\",\"1\"" "$AC"'
+ok "newest patch file wins (warning)" 'grep -qi "newer\|newest\|superseded" "$T/err"'
+ok "old file values not used" '[[ $(col "$SV" billing-aurora-mysql 111111111111 6) == Compliant ]]'
+ok "neptune retention 1 -> Fail" '[[ $(col "$SV" graph-neptune 111111111111 11) == Fail ]]'
+ok "new docdb -> Not yet due" '[[ $(col "$SV" new-docdb 111111111111 11) == "Not yet due" ]]'
+ok "docdb compliant -> OK" '[[ $(col "$SV" catalog-docdb 111111111111 11) == OK ]]'
+ok "docdb replica us-west-2 OK" '[[ $(col "$SV" catalog-docdb-dr 111111111111 11) == OK ]]'
+ok "docdb monthly fail (222)" '[[ $(col "$SV" dev-docdb 222222222222 11) == Fail ]]'
+ok "retention mismatch = Warning" '[[ $(col "$SV" orders-aurora-pg15 111111111111 11) == Warning ]]'
+ok "deprecated -> Unknown" '[[ $(col "$SV" old-aurora-pg11 111111111111 6) == Unknown ]]'
+ok "no backup file reason" '[[ $(col "$SV" hr-sql 222222222222 12) == "no backup file for this account" ]]'
+ok "not in data reason" '[[ $(col "$SV" hr-sql 111111111111 12) == "not in the backup data of this account" ]]'
+ok "no patch data for docdb new" '[[ $(col "$SV" new-docdb 111111111111 6) == "No data" ]]'
+ok "aurora ignored by docdb collector" '! grep -q "aurora-ignore" "$SV"'
+ok "csv BOM" '[[ $(head -c3 "$SV" | od -An -tx1 | tr -d " ") == efbbbf ]]'
+ok "csv CRLF" 'head -1 "$SV" | grep -q $'"'"'\r$'"'"''
+ok "dotted version wrapped" 'grep -q "\"=\"\"15.8\"\"\"" "$SV"'
+ok "full paths printed" 'grep -q "$O/rds_compliance_report_2_accounts" "$T/err" "$T/out"'
+ok "UTC + IST" 'grep -q "IST" "$TX" && grep -q "UTC" "$TX"'
+ok "html single file, no external refs" '! grep -qiE "<(link|script)[^>]+(src|href)=\"?https?:" "$H"'
+ok "html no expandable rows" '! grep -q "<details" "$H"'
+
+echo "== options"
+run --merge "$HERE/fixtures" -o "$T/mb0" --max-behind 0
+ok "--max-behind 0 lowers patch %" '! grep -q "58.6%" "$T/mb0"/*.txt && [[ $(col "$T"/mb0/*_servers.csv billing-aurora-mysql 111111111111 6) == Non-compliant ]]'
+run --merge "$HERE/fixtures" -o "$T/mb9" --max-behind 9
+ok "--max-behind 9 more compliant" '[[ $(col "$T"/mb9/*_servers.csv hr-sql 111111111111 6) == Compliant ]]'
+run --merge "$HERE/fixtures" -o "$T/oal" --oracle-any-patch-line
+ok "--oracle-any-patch-line runs" '[[ $(rc) == 0 ]]'
+run --merge "$HERE/fixtures/rds_patch_222222222222_20261103.json" -o "$T/one"
+ok "single account name" 'ls "$T/one" | grep -q "_222222222222_20261103_100000.html"'
+ok "missing source = No data, excluded" 'grep -q "No data" "$T"/one/*.txt'
+run --merge "$HERE/fixtures" -o "$T/cfg" --monthly 0 --yearly 0
+ok "backup thresholds passed" '[[ $(col "$T"/cfg/*_servers.csv dev-docdb 222222222222 11) != Fail ]]'
+
+echo "== bad input -> 3"
+run --merge "$T/nope" -o "$T/x"; ok "missing path" '[[ $(rc) == 3 ]]'
+mkdir -p "$T/empty"; run --merge "$T/empty" -o "$T/x"; ok "empty dir" '[[ $(rc) == 3 ]]'
+echo 'not json' >"$T/rds_patch_1_x.json"; run --merge "$T/rds_patch_1_x.json" -o "$T/x"; ok "not json" '[[ $(rc) == 3 ]]'
+echo '{"schema":"other"}' >"$T/w.json"; run --merge "$T/w.json" -o "$T/x"; ok "wrong schema" '[[ $(rc) == 3 ]]'
+
+echo "== CRLF jq (Git Bash) + escaping"
+mkdir -p "$T/crjq"; J="$(command -v jq)"; printf '#!/bin/sh\n"%s" "$@" | sed "s/$/\\r/"\n' "$J" >"$T/crjq/jq"; chmod +x "$T/crjq/jq"
+PATH="$T/crjq:$PATH" run --merge "$HERE/fixtures" -o "$T/cr"
+ok "CRLF jq merge exit 0" '[[ $(rc) == 0 ]]'
+ok "CRLF jq same summary" 'grep -q "58.6%" "$T"/cr/*.txt && [[ $(ls "$T/cr" | wc -l) == 6 ]]'
+mkdir -p "$T/inj"; cp "$HERE"/fixtures/*.json "$T/inj/"; jq '.resources[0].id="<script>alert(1)</script>=HYPERLINK(\"x\")"' "$HERE/fixtures/rds_compliance_222222222222_20261103.json" >"$T/inj/rds_compliance_222222222222_20261103.json"
+run --merge "$T/inj" -o "$T/injo"; IH="$(ls "$T"/injo/*.html)"
+ok "no raw <script>alert in html" '! grep -q "<script>alert" "$IH"'
+ok "injected value present escaped" 'grep -q "u003cscript" "$IH"'
+ok "csv formula prefix" 'grep -q "\"'"'"'<script>\|\"<script>" "$T"/injo/*_servers.csv'
+jq '.resources[0].id="=HYPERLINK(1)"' "$HERE/fixtures/rds_compliance_222222222222_20261103.json" >"$T/inj/rds_compliance_222222222222_20261103.json"
+run --merge "$T/inj" -o "$T/inj2"; ok "csv = prefixed with '" 'grep -q "\"'"'"'=HYPERLINK" "$T"/inj2/*_servers.csv'
+
+echo "== collector (mock aws)"
+export MOCK_LOG="$T/calls"
+PATH="$MPATH" run --save-data -P prod -A -o "$T/c1"
+ok "collect exit 0" '[[ $(rc) == 0 ]]'
+ok "writes rds_compliance_ACCT_DATE.json" '[[ -s "$T/c1/rds_compliance_111111111111_20261103.json" ]]'
+ok "only allowed calls" '! grep -vE "^(sts get-caller-identity|ec2 describe-regions|rds describe-db-clusters|rds describe-db-cluster-snapshots|backup list-backup-vaults|backup list-recovery-points-by-backup-vault)( |$)" <(sed -E "s/^(--[a-z-]+ [^ ]+ )*//" "$T/calls" | awk "{print \$1, \$2}")'
+ok "region lines + summary" 'grep -q "us-east-1" "$T/err" && grep -q "regions scanned" "$T/err"'
+ok "empty regions hidden without -v" '! grep -q "\] eu-west-1:" "$T/err"'
+PATH="$MPATH" run --save-data -P prod -A -o "$T/c2" -v --parallel 1
+ok "-v shows all regions" 'grep -q "\] eu-west-1:" "$T/err"'
+ok "--parallel 1 same resources" '[[ "$(jq -c "[.resources[]|.id]|sort" "$T"/c1/*.json)" == "$(jq -c "[.resources[]|.id]|sort" "$T"/c2/*.json)" ]]'
+ok "only docdb/neptune collected" '[[ $(jq "[.resources[]|select(.engine!=\"docdb\" and .engine!=\"neptune\")]|length" "$T"/c1/*.json) == 0 ]]'
+MOCK_SCENARIO=backupdeny PATH="$MPATH" run --save-data -P prod -A -o "$T/c3"
+cp "$T"/c3/*.json "$T/bd.json" 2>/dev/null; run --merge "$T/bd.json" -o "$T/c3m"
+ok "backup denied -> Unknown or Fail, no crash" '[[ $(rc) == 0 ]] && grep -qE "Unknown|Fail" "$T"/c3m/*_servers.csv'
+MOCK_SCENARIO=regionfail PATH="$MPATH" run --save-data -P prod -A -o "$T/c4"
+ok "region failure recorded" 'jq -e "[.regions[]?|select(.status==\"error\")]|length>0" "$T"/c4/*.json >/dev/null'
+MOCK_SCENARIO=empty PATH="$MPATH" run --save-data -P prod -A -o "$T/c5"; ok "empty account ok" '[[ $(rc) == 0 ]]'
+PATH="$MPATH" run --save-data -P prod -r us-east-1 --dry-run -o "$T/c6"; ok "dry-run exit 0" '[[ $(rc) == 0 ]]'
+
+echo "== shellcheck"
+if command -v shellcheck >/dev/null; then ok "shellcheck" 'shellcheck -x "$S" "$HERE/run_tests.sh"'; else echo "  skip shellcheck"; fi
+
+echo "== browser"
+if command -v node >/dev/null && [[ -x "${CHROME:-/usr/bin/google-chrome}" ]] && node -e 'require("puppeteer-core")' 2>/dev/null; then
+  res="$(EXPECT='{"servers":32,"patch":"58.6%","backup":"40%"}' node "$HERE/browser_check.js" "$H" ${SHOTS:+"$SHOTS"} 2>&1)"; brc=$?
+  echo "  $res"; ok "browser check" '[[ $brc == 0 ]]'
+  res="$(EXPECT='{"inject":1}' node "$HERE/browser_check.js" "$IH" 2>&1)"; brc=$?; [[ $brc == 0 ]] || echo "  $res"; ok "browser check (injected id, no alert)" '[[ $brc == 0 ]]'
+else echo "  skip browser check (node + puppeteer-core on NODE_PATH + Chrome)"; fi
+
+[[ -n "${KEEP:-}" ]] && cp -r "$T" "$KEEP"
+echo; echo "passed $PASS, failed $FAIL"; [[ $FAIL == 0 ]]

@@ -1,0 +1,32 @@
+# rds_compliance_report.sh --config FILE
+# key=value, long option names without "--". Never sourced. Command-line options override these.
+# --- collect (--save-data): DocumentDB / Neptune backup data
+# profile=prod,dev
+# region=us-east-1,us-west-2
+# all-regions=true
+# parallel=4
+# aws-timeout=60
+# max-attempts=5
+# --- merge: patch rule (same as rds-patch-compliance)
+# max-behind=2
+# oracle-any-patch-line=true
+# --- merge: backup rules (same names and defaults as rds-backup-compliance)
+# daily=7
+# daily-max-age=26
+# weekly=auto
+# weekly-weekday=sat
+# weekly-window-days=30
+# monthly=12
+# monthly-rule=first-sun
+# yearly=0
+# weekly-days=25-40
+# monthly-days=300-400
+# tolerance-days=1
+# daily-retention-days=7
+# weekly-retention-days=30
+# monthly-retention-days=365
+# retention-tolerance-days=1
+# --- output
+# output-dir=./reports
+# prefix=rds_compliance_report
+# tz=Asia/Kolkata

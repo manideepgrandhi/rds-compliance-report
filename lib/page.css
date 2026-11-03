@@ -1,0 +1,15 @@
+:root{--bg:#f6f7f9;--fg:#1b1f24;--mut:#5b6470;--card:#fff;--bd:#d9dde3;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--unk:#6e7781;--acc:#0969da}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+header{background:#24292f;color:#fff;padding:14px 20px}header h1{margin:0;font-size:20px}header p{margin:4px 0 0;color:#c9d1d9;font-size:12px}
+main{padding:16px 20px;max-width:1500px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px 14px}.card .v{font-size:30px;font-weight:600}.card .l{color:var(--mut);font-size:12px}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px;margin-bottom:16px;position:sticky;top:0;z-index:2}
+.filters select,.filters input{font:inherit;padding:5px 8px;border:1px solid var(--bd);border-radius:6px;background:#fff;max-width:100%}.filters input{flex:1;min-width:160px}
+button{font:inherit;padding:5px 12px;border:1px solid var(--bd);border-radius:6px;background:#f3f4f6;cursor:pointer}button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+h2{font-size:16px;margin:20px 0 8px}.wrap{overflow-x:auto;background:var(--card);border:1px solid var(--bd);border-radius:8px}
+table{border-collapse:collapse;width:100%}th,td{padding:6px 10px;border-bottom:1px solid #eef0f3;text-align:left;vertical-align:top;white-space:nowrap}
+th{background:#f0f2f5;font-size:12px;color:var(--mut);position:sticky;top:0}td.p{white-space:normal;min-width:240px;max-width:360px}td.r{white-space:normal;min-width:220px;max-width:420px;color:var(--mut);font-size:12px}td.n,th.n{text-align:right}
+.b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;color:#fff}.s-ok{background:var(--ok)}.s-warn{background:var(--warn)}.s-bad{background:var(--bad)}.s-unk{background:var(--unk)}.s-nd{background:#fff;color:var(--mut);border:1px dashed var(--mut)}.s-nyd{background:#8250df}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:12px}.mut{color:var(--mut);font-size:12px}footer{padding:16px 20px;color:var(--mut);font-size:12px}
+@media (max-width:640px){main{padding:10px}.grid3{grid-template-columns:1fr}.card .v{font-size:24px}.filters{position:static}th,td{padding:5px 6px}}
