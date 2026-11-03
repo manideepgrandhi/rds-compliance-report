@@ -13,8 +13,9 @@ run() { "$S" "$@" >"$T/out" 2>"$T/err"; echo $? >"$T/rc"; }
 rc() { cat "$T/rc"; }
 
 echo "== usage"
-run --version; ok "--version" '[[ $(rc) == 0 ]] && grep -q "1.0.0" "$T/out"'
-run; ok "no mode -> 1" '[[ $(rc) == 1 ]]'
+run --version; ok "--version" '[[ $(rc) == 0 ]] && grep -q "1.1.0" "$T/out"'
+run; ok "no args -> usage, 1" '[[ $(rc) == 1 ]] && grep -q "save-data" "$T/out"'
+run -A; ok "no mode -> 1" '[[ $(rc) == 1 ]]'
 run --merge "$HERE/fixtures"; ok "merge without -o -> 1" '[[ $(rc) == 1 ]]'
 run --bogus; ok "unknown option -> 1" '[[ $(rc) == 1 ]]'
 
@@ -38,7 +39,7 @@ ok "docdb replica us-west-2 OK" '[[ $(col "$SV" catalog-docdb-dr 111111111111 11
 ok "docdb monthly fail (222)" '[[ $(col "$SV" dev-docdb 222222222222 11) == Fail ]]'
 ok "retention mismatch = Warning" '[[ $(col "$SV" orders-aurora-pg15 111111111111 11) == Warning ]]'
 ok "deprecated -> Unknown" '[[ $(col "$SV" old-aurora-pg11 111111111111 6) == Unknown ]]'
-ok "no backup file reason" '[[ $(col "$SV" hr-sql 222222222222 12) == "no backup file for this account" ]]'
+ok "no backup file reason" '[[ $(col "$SV" hr-sql 222222222222 12) == "no backup data for this account" ]]'
 ok "not in data reason" '[[ $(col "$SV" hr-sql 111111111111 12) == "not in the backup data of this account" ]]'
 ok "no patch data for docdb new" '[[ $(col "$SV" new-docdb 111111111111 6) == "No data" ]]'
 ok "aurora ignored by docdb collector" '! grep -q "aurora-ignore" "$SV"'
@@ -82,25 +83,49 @@ ok "csv formula prefix" 'grep -q "\"'"'"'<script>\|\"<script>" "$T"/injo/*_serve
 jq '.resources[0].id="=HYPERLINK(1)"' "$HERE/fixtures/rds_compliance_222222222222_20261103.json" >"$T/inj/rds_compliance_222222222222_20261103.json"
 run --merge "$T/inj" -o "$T/inj2"; ok "csv = prefixed with '" 'grep -q "\"'"'"'=HYPERLINK" "$T"/inj2/*_servers.csv'
 
-echo "== collector (mock aws)"
+echo "== collector (mock aws, one scan per account)"
+export MOCK_NOW=1793700000
 export MOCK_LOG="$T/calls"
-PATH="$MPATH" run --save-data -P prod -A -o "$T/c1"
+PATH="$MPATH" run --save-data -P prod,nonprod -A -o "$T/c1"
 ok "collect exit 0" '[[ $(rc) == 0 ]]'
-ok "writes rds_compliance_ACCT_DATE.json" '[[ -s "$T/c1/rds_compliance_111111111111_20261103.json" ]]'
-ok "only allowed calls" '! grep -vE "^(sts get-caller-identity|ec2 describe-regions|rds describe-db-clusters|rds describe-db-cluster-snapshots|backup list-backup-vaults|backup list-recovery-points-by-backup-vault)( |$)" <(sed -E "s/^(--[a-z-]+ [^ ]+ )*//" "$T/calls" | awk "{print \$1, \$2}")'
-ok "region lines + summary" 'grep -q "us-east-1" "$T/err" && grep -q "regions scanned" "$T/err"'
+ok "one rds_compliance_ACCT_DATE.json per account" '[[ -s "$T/c1/rds_compliance_111111111111_20261103.json" && -s "$T/c1/rds_compliance_222222222222_20261103.json" && $(ls "$T/c1" | wc -l) == 2 ]]'
+ok "schema v2 with patch, backup, docdb" 'jq -e ".schema_version==2 and (.patch.rows|length>0) and (.backup.resources|length>0) and (.docdb.resources|length>0)" "$T/c1/rds_compliance_111111111111_20261103.json" >/dev/null'
+ok "only read-only calls" '! jq -r ".[0:2]|join(\" \")" "$T/calls" | grep -vE "^(sts get-caller-identity|ec2 describe-regions|rds describe-(db-clusters|db-instances|pending-maintenance-actions|db-cluster-snapshots|db-snapshots|db-engine-versions|db-major-engine-versions|global-clusters)|(docdb|neptune) describe-db-engine-versions|backup list-(backup-vaults|recovery-points-by-backup-vault))$"'
+ok "each call once per region (per engine/version/vault)" '[[ -z "$(jq -c "def g(\$f): (index(\$f)) as \$i | if \$i then .[\$i+1] else null end; [g(\"--profile\"), g(\"--region\"), .[0], .[1], g(\"--engine\"), g(\"--engine-version\"), g(\"--backup-vault-name\")]" "$T/calls" | sort | uniq -d)" ]]'
+ok "global clusters once per account" '[[ $(jq -r ".[1]" "$T/calls" | grep -c "^describe-global-clusters$") == 2 ]]'
+ok "clusters + instances once per region" '[[ $(jq -r ".[1]" "$T/calls" | grep -c "^describe-db-clusters$") == 10 && $(jq -r ".[1]" "$T/calls" | grep -c "^describe-db-instances$") == 10 ]]'
+ok "aws_calls in file = calls made" '[[ $(jq -s "map(.aws_calls)|add" "$T"/c1/*.json) == $(wc -l < "$T/calls") ]]'
+ok "region lines + summary" 'grep -q "us-east-1: 15 clusters, 35 instances" "$T/err" && grep -q "regions scanned" "$T/err"'
+ok "plurals" '! grep -qE "\b1 (clusters|instances|snapshots)\b|\b([02-9]|[0-9]{2,}) (cluster|instance|snapshot),"  "$T/err"'
+ok "no sibling-file wording" '! grep -qiE "rds_patch_|rds_backup_|sibling" "$T/err" "$T/out"'
 ok "empty regions hidden without -v" '! grep -q "\] eu-west-1:" "$T/err"'
+unset MOCK_LOG
 PATH="$MPATH" run --save-data -P prod -A -o "$T/c2" -v --parallel 1
 ok "-v shows all regions" 'grep -q "\] eu-west-1:" "$T/err"'
-ok "--parallel 1 same resources" '[[ "$(jq -c "[.resources[]|.id]|sort" "$T"/c1/*.json)" == "$(jq -c "[.resources[]|.id]|sort" "$T"/c2/*.json)" ]]'
-ok "only docdb/neptune collected" '[[ $(jq "[.resources[]|select(.engine!=\"docdb\" and .engine!=\"neptune\")]|length" "$T"/c1/*.json) == 0 ]]'
+ok "--parallel 1 same data" '[[ "$(jq -cS "[.patch.rows, .backup.resources, .docdb.resources]" "$T"/c2/*.json)" == "$(jq -cS "[.patch.rows, .backup.resources, .docdb.resources]" "$T"/c1/rds_compliance_111111111111_20261103.json)" ]]'
+run --merge "$T/c1" -o "$T/c1m"
+ok "merge v2 files" '[[ $(rc) == 0 ]] && grep -q "inputs: 2 files" "$T/err" && [[ $(tail -n +2 "$T"/c1m/*_servers.csv | wc -l) == 36 ]]'
+for sib in patch backup; do
+  d="$HERE/../../rds-$sib-compliance"
+  if [[ -x "$d/rds_${sib}_compliance_report.sh" ]]; then
+    PATH="$MPATH" "$d/rds_${sib}_compliance_report.sh" --save-data -P prod,nonprod -A -o "$T/sib" >/dev/null 2>&1
+  fi
+done
+if ls "$T"/sib/rds_patch_*.json "$T"/sib/rds_backup_*.json >/dev/null 2>&1; then
+  ok "parity: patch rows = rds-patch-compliance" '[[ "$(jq -cS -s "map(.rows[])|sort_by(.account,.region,.identifier)" "$T"/sib/rds_patch_*.json)" == "$(jq -cS -s "map(.patch.rows[])|sort_by(.account,.region,.identifier)" "$T"/c1/*.json)" ]]'
+  ok "parity: backup resources = rds-backup-compliance" '[[ "$(jq -cS -s "map(.resources[]|del(.arn))|sort_by(.account,.region,.id)" "$T"/sib/rds_backup_*.json)" == "$(jq -cS -s "map(.backup.resources[])|sort_by(.account,.region,.id)" "$T"/c1/*.json)" ]]'
+  cp "$T"/c1/*.json "$T/sib/x.json" 2>/dev/null; for f in "$T"/c1/*.json; do jq ".docdb" "$f" >"$T/sib/d_${f##*/}"; done; rm -f "$T/sib/x.json"
+  run --merge "$T/sib" -o "$T/sibm"
+  ok "parity: servers CSV identical" 'cmp -s "$(ls "$T"/sibm/*_servers.csv)" "$(ls "$T"/c1m/*_servers.csv)"'
+else echo "  skip parity (sibling repos not found next to this repo)"; fi
 MOCK_SCENARIO=backupdeny PATH="$MPATH" run --save-data -P prod -A -o "$T/c3"
 cp "$T"/c3/*.json "$T/bd.json" 2>/dev/null; run --merge "$T/bd.json" -o "$T/c3m"
 ok "backup denied -> Unknown or Fail, no crash" '[[ $(rc) == 0 ]] && grep -qE "Unknown|Fail" "$T"/c3m/*_servers.csv'
 MOCK_SCENARIO=regionfail PATH="$MPATH" run --save-data -P prod -A -o "$T/c4"
-ok "region failure recorded" 'jq -e "[.regions[]?|select(.status==\"error\")]|length>0" "$T"/c4/*.json >/dev/null'
+ok "region failure recorded" 'jq -e "[.backup.regions[]?, .patch.region_status[]? | select(.status==\"error\")]|length>0" "$T"/c4/*.json >/dev/null'
 MOCK_SCENARIO=empty PATH="$MPATH" run --save-data -P prod -A -o "$T/c5"; ok "empty account ok" '[[ $(rc) == 0 ]]'
 PATH="$MPATH" run --save-data -P prod -r us-east-1 --dry-run -o "$T/c6"; ok "dry-run exit 0" '[[ $(rc) == 0 ]]'
+PATH="$MPATH" run --save-data -P bogus -r us-east-1 -o "$T/c7"; ok "bad profile -> nonzero, no file" '[[ $(rc) != 0 ]] && ! ls "$T"/c7/*.json >/dev/null 2>&1'
 
 echo "== shellcheck"
 if command -v shellcheck >/dev/null; then ok "shellcheck" 'shellcheck -x "$S" "$HERE/run_tests.sh"'; else echo "  skip shellcheck"; fi

@@ -21,7 +21,7 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
 | ([ $PR[] | {key: key, value: .} ] | from_entries) as $PI
 | ([ $BR[] | {key: key, value: .} ] | from_entries) as $BI
 | def prow($p; $a; $k): if $p == null then
-      {patch_status: "No data", patch_reason: (if ($PE | index([$k])) then "patch scan of this region failed" elif ($PAC | index([$a])) then "not in the patch data of this account" else "no patch file for this account" end),
+      {patch_status: "No data", patch_reason: (if ($PE | index([$k])) then "patch scan of this region failed" elif ($PAC | index([$a])) then "not in the patch data of this account" else "no patch data for this account" end),
        current_version: null, latest_version: null, versions_behind: null}
     else {patch_status: ($p.compliance_status | pmap), current_version: $p.current_version, latest_version: $p.latest_minor_version,
           versions_behind: $p.versions_behind,
@@ -30,8 +30,8 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
                            (if ($p.auto_minor_upgrade | tostring) == "false" then "auto minor upgrade off" else empty end),
                            (if $p.past_standard_support == true then "past standard support" else empty end) ] | join("; "))} end;
   def brow($b; $a; $e; $k): if $b == null then
-      {backup_status: "No data", backup_reason: (if ($BE | index([$k])) then "backup scan of this region failed" elif ($e // "" | dn) then (if ($DAC | index([$a])) then "not in the DocumentDB/Neptune data of this account" else "no rds_compliance (DocumentDB/Neptune) file for this account" end)
-                                                  else (if ($BAC | index([$a])) then "not in the backup data of this account" else "no backup file for this account" end) end)}
+      {backup_status: "No data", backup_reason: (if ($BE | index([$k])) then "backup scan of this region failed" elif ($e // "" | dn) then (if ($DAC | index([$a])) then "not in the DocumentDB/Neptune data of this account" else "no DocumentDB/Neptune data for this account" end)
+                                                  else (if ($BAC | index([$a])) then "not in the backup data of this account" else "no backup data for this account" end) end)}
     else ([ ($b.warnings // ""), ($b.retention_mismatch // ""), ($b.excess // "" | if . == "" then "" else "excess: " + . end), ($b.over_retention // "") ] | map(select(. != ""))) as $w
       | if $b.status == "NON-COMPLIANT" then {backup_status: "Fail", backup_reason: $b.gaps}
         elif $b.status == "UNKNOWN" then {backup_status: "Unknown", backup_reason: (if $b.gaps == "" then "a call failed" else $b.gaps end)}

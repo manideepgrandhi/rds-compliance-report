@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
 # rds_compliance_report.sh - one lightweight patch + backup compliance report for Aurora, RDS, Multi-AZ clusters,
-# DocumentDB and Neptune, built OFFLINE from the --save-data files of the two full tools:
-#   rds_patch_<ACCT>_<YYYYMMDD>.json    rds-patch-compliance  --save-data   (schema rds_patch_compliance_data)
-#   rds_backup_<ACCT>_<YYYYMMDD>.json   rds-backup-compliance --save-data   (schema rds_backup_compliance_data, v1.5.1+)
-#   rds_compliance_<ACCT>_<YYYYMMDD>.json  this script --save-data: DocumentDB / Neptune backups only (rds-backup-compliance
-#                                       skips those engines). READ-ONLY: sts get-caller-identity, ec2 describe-regions (-A),
-#                                       rds describe-db-clusters / describe-db-cluster-snapshots, backup list-backup-vaults /
-#                                       list-recovery-points-by-backup-vault.
+# DocumentDB and Neptune. One script, two steps:
+#   --save-data   one read-only scan per account (CloudShell) -> rds_compliance_<ACCOUNT>_<YYYYMMDD>.json
+#                 calls: sts get-caller-identity, ec2 describe-regions (-A), and once per region rds describe-db-clusters,
+#                 describe-db-instances, describe-pending-maintenance-actions, describe-db-cluster-snapshots,
+#                 describe-db-snapshots, describe-db-engine-versions (per engine version), describe-db-major-engine-versions
+#                 (per engine), backup list-backup-vaults / list-recovery-points-by-backup-vault; once per account
+#                 rds describe-global-clusters
+#   --merge       the report from those files, 0 AWS calls (CloudShell, Linux, macOS, Git Bash)
 # Rules: none of its own. Patch status = rds-patch-compliance (versions behind > --max-behind is NON-COMPLIANT, a deprecated
 # version is UNKNOWN); backup status = rds-backup-compliance lib/backup.jq (retention mismatch, excess backups and
-# over-retention are warnings). The jq of both tools is copied unchanged into lib/.
+# over-retention are warnings). The jq of both tools (collection and evaluation) is copied unchanged into lib/.
 # Exit: 0 ok, 1 usage, 2 pre-check, 3 bad --merge input, 4 output error, 130 interrupted.
 
 # shellcheck disable=SC2016,SC2034  # jq programs are single-quoted on purpose; KEEP_WORKDIR is read in the EXIT trap
@@ -18,11 +19,11 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 LIBDIR="${RDS_CR_LIB:-$SCRIPT_DIR/lib}"
-readonly DATA_SCHEMA="rds_compliance_data" DATA_SCHEMA_VERSION=1
+readonly DATA_SCHEMA="rds_compliance_data" DATA_SCHEMA_VERSION=2
 readonly PATCH_SCHEMA="rds_patch_compliance_data" BACKUP_SCHEMA="rds_backup_compliance_data"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
@@ -51,13 +52,14 @@ usage() {
     cat <<USAGE
 $SCRIPT_NAME $SCRIPT_VERSION - patch + backup compliance in one offline report
 
-Collect DocumentDB / Neptune backup data (CloudShell, read-only):
+1. Collect, once per account (CloudShell, read-only) -> rds_compliance_<ACCOUNT>_<YYYYMMDD>.json:
   $SCRIPT_NAME --save-data [FILE] [-P PROFILE[,..]] [-r REGION[,..] | -A] [--parallel N] [-o DIR] [-v]
 
-Build the report from saved files (0 AWS calls; CloudShell, Linux, macOS, Git Bash):
+2. Build the report from those files (0 AWS calls; CloudShell, Linux, macOS, Git Bash):
   $SCRIPT_NAME --merge FILE|DIR [FILE|DIR ...] -o DIR [options]
-    inputs: rds_patch_*.json (rds-patch-compliance --save-data), rds_backup_*.json (rds-backup-compliance v1.5.1+
-    --save-data), rds_compliance_*.json (this script --save-data). Per account and source the newest collection wins.
+    inputs: rds_compliance_*.json. Per account the newest collection wins.
+
+Example: $SCRIPT_NAME --save-data -A   then   $SCRIPT_NAME --merge . -o report
 
 Options
   -P, --profile P[,P]     AWS CLI profile(s) (collect)          -r, --region R[,R]   regions (collect)
@@ -156,7 +158,7 @@ parse_args() {
     done
     (( WEEKLY_MIN_DAYS <= WEEKLY_MAX_DAYS && WEEKLY_MAX_DAYS < MONTHLY_MIN_DAYS && MONTHLY_MIN_DAYS <= MONTHLY_MAX_DAYS )) \
         || die 1 "Need weekly-days MIN <= MAX < monthly-days MIN <= MAX (got weekly $WEEKLY_MIN_DAYS-$WEEKLY_MAX_DAYS, monthly $MONTHLY_MIN_DAYS-$MONTHLY_MAX_DAYS)"
-    (( MERGE || SAVE_DATA )) || die 1 "Choose --save-data (collect DocumentDB / Neptune data) or --merge FILE|DIR ... (build the report); see --help"
+    (( MERGE || SAVE_DATA )) || die 1 "Choose --save-data (collect) or --merge FILE|DIR ... (build the report); see --help"
     if (( MERGE )); then
         (( ${#MERGE_ARGS[@]} )) || die 1 "--merge needs at least one FILE or DIR"
         (( ${#PROFILES[@]} || ${#REGIONS[@]} || ALL_REGIONS )) && die 1 "--merge works offline: do not combine it with -P / -r / -A"
@@ -204,17 +206,74 @@ awsc() {   # awsc <out-file> <profile> <region> <service> <operation> [args...];
 }
 err_of() { tr -d '\r' <"$1.err" 2>/dev/null | grep -v '^[[:space:]]*$' | sed -E 's/^aws: \[ERROR\]: //; s/An error occurred //' | head -1 | cut -c1-200 || true; }
 
-scan_region() {   # scan_region <profile> <account> <region> <dir> -> <dir>/resources.json, <dir>/region.json
-    local prof="$1" acct="$2" reg="$3" d="$4" e n; local -a errs=()
-    local c0=$AWS_CALLS f0=$AWS_FAILS csnap_ok=true backup_ok=true
-    echo '{}' >"$d/c.json"; echo '{}' >"$d/cs.json"; echo '[]' >"$d/rp.json"
-    awsc "$d/c.json" "$prof" "$reg" rds describe-db-clusters --filters Name=engine,Values=docdb,neptune \
-        || { errs+=("describe-db-clusters: $(err_of "$d/c.json")"); echo '{}' >"$d/c.json"; }
-    n="$(jqv '[.DBClusters[]? | select(.Engine // "" | test("^(docdb|neptune)"))] | length' "$d/c.json")"
+svc_of() { case "$1" in docdb) echo docdb ;; neptune) echo neptune ;; *) echo rds ;; esac; }
+perr() {   # perr <dir> <account> <profile> <region> <call> <message>: an error entry of the patch data (rds-patch-compliance format)
+    jqv -cn --arg a "$2" --arg p "${3:-default}" --arg r "$4" --arg c "$5" --arg m "$6" '{account: $a, profile: $p, region: $r, call: $c, message: $m}' >>"$1/perr.jsonl"
+}
+collect_versions() {   # as rds-patch-compliance: one describe-db-engine-versions per (engine, version), one lifecycle call per rds engine
+    local prof="$1" reg="$2" d="$3" engine ver svc key cache lc m; local -a evs=() lcs=()
+    mkdir -p "$d/ev"
+    while IFS=$'\t' read -r engine ver; do
+        [[ -n "$engine" ]] || continue
+        svc="$(svc_of "$engine")"; key="$(printf '%s_%s' "$engine" "$ver" | tr -c 'A-Za-z0-9._-' '_')"; cache="$d/ev/ev_$key.json"
+        if [[ ! -s "$cache" ]]; then
+            if awsc "$cache.raw" "$prof" "$reg" "$svc" describe-db-engine-versions --engine "$engine" --engine-version "$ver"; then
+                jqv -c --arg e "$engine" --arg v "$ver" '[.DBEngineVersions[]? | select(.Engine == $e and .EngineVersion == $v)][0] as $x
+                    | {key: ($e + "|" + $v), value: {ok: true, error: null, returned: ($x != null),
+                       major: ($x.MajorEngineVersion // (($x.DBParameterGroupFamily // "") | sub("^[A-Za-z-]+"; "") | if . == "" then null else . end)),
+                       targets: [($x.ValidUpgradeTarget // [])[] | {Engine, EngineVersion, IsMajorVersionUpgrade, AutoUpgrade}]}}' "$cache.raw" >"$cache"
+                [[ "$(jqv -r '.value.returned' "$cache")" == true ]] || log_warn "$reg: $engine $ver is not returned by describe-db-engine-versions (deprecated / not offered here); its servers are UNKNOWN"
+            else
+                AWS_FAILS=$((AWS_FAILS - 1)); m="$(err_of "$cache.raw")"   # supplementary lookup: a warning, not a failure (as the patch tool)
+                log_warn "$reg: engine-version lookup for $engine $ver failed ($m); its servers are UNKNOWN"
+                jqv -cn --arg e "$engine" --arg v "$ver" --arg m "$m" '{key: ($e + "|" + $v), value: {ok: false, error: $m, returned: false, major: null, targets: []}}' >"$cache"
+            fi
+        fi
+        evs+=("$cache"); [[ "$svc" == rds ]] || continue
+        lc="$d/ev/lc_$engine.json"
+        if [[ ! -s "$lc" && ! -e "$WORK/lc_unsupported" ]]; then
+            if awsc "$lc.raw" "$prof" "$reg" rds describe-db-major-engine-versions --engine "$engine"; then
+                jqv -c --arg e "$engine" '{key: $e, value: {majors: [.DBMajorEngineVersions[]? | {MajorEngineVersion, SupportedEngineLifecycles}]}}' "$lc.raw" >"$lc"
+            else
+                AWS_FAILS=$((AWS_FAILS - 1)); m="$(err_of "$lc.raw")"
+                if [[ "$m" == *"nvalid choice"* ]]; then : >"$WORK/lc_unsupported"; log_warn "This AWS CLI has no 'rds describe-db-major-engine-versions' (upgrade the CLI); support end dates show 'unknown'"
+                else log_warn "$reg: lifecycle lookup for $engine failed ($m); support end dates show 'unknown'"; fi
+                printf '{}' >"$lc"
+            fi
+        fi
+        [[ -s "$lc" ]] && lcs+=("$lc")
+    done < <(jqv -r -s '[.[0][], .[1][]] | map(select((.Engine // "") != "" and (.EngineVersion // "") != "") | [.Engine, .EngineVersion]) | unique[]
+                       | select(.[0] | test("^(aurora-postgresql|aurora-mysql|postgres|mysql|mariadb|sqlserver-(ee|se|ex|web)|oracle-(ee|se2|ee-cdb|se2-cdb)|docdb|neptune)$")) | @tsv' \
+                 "$d/instances.json" "$d/clusters.json")
+    if (( ${#evs[@]} )); then jqv -cs 'from_entries' -- "${evs[@]}" >"$d/ev.json"; else printf '{}' >"$d/ev.json"; fi
+    if (( ${#lcs[@]} )); then jqv -cs 'map(select(has("key"))) | from_entries' -- "${lcs[@]}" >"$d/lc.json"; else printf '{}' >"$d/lc.json"; fi
+}
+patch_rows() {   # rds-patch-compliance lib/compliance.jq, mode rows (the status is recomputed at merge with --max-behind)
+    TZ="$DISPLAY_TZ" jq -n --arg mode rows --argjson now "$NOW" --argjson max_behind "${MAX_BEHIND:-2}" --argjson warn_days 180 --argjson top_n 10 \
+        --argjson nc_only false --argjson oracle_any "${ORACLE_ANY:-false}" --argjson tagcols '[]' --argjson f '{"engines":[],"identifiers":[]}' \
+        --arg profile "${1:-default}" --arg account "$2" --arg region "$3" --slurpfile clusters "$4/clusters.json" --slurpfile instances "$4/instances.json" \
+        --slurpfile pma "$4/pma.json" --slurpfile ev "$4/ev.json" --slurpfile lc "$4/lc.json" -f "$LIBDIR/patch_compliance.jq" | tr -d '\r'
+}
+
+# One scan per region, every call once: the patch and the backup data share describe-db-clusters / describe-db-instances.
+# With -A these two full calls are also the region discovery: a region with neither is empty and gets no further call.
+scan_region() {   # scan_region <profile> <account> <region> <dir> -> raw files, rows.json (patch), scan.json
+    local prof="$1" acct="$2" reg="$3" d="$4" e n nc ni; local -a errs=()
+    local c0=$AWS_CALLS f0=$AWS_FAILS csnap_ok=true isnap_ok=true backup_ok=true cl_ok=1 in_ok=1
+    : >"$d/perr.jsonl"
+    for e in c i cs is; do echo '{}' >"$d/$e.json"; done; echo '[]' >"$d/rp.json"; echo '[]' >"$d/pma.json"; echo '[]' >"$d/rows.json"
+    awsc "$d/c.json" "$prof" "$reg" rds describe-db-clusters || { cl_ok=0; e="$(err_of "$d/c.json")"; errs+=("describe-db-clusters: $e"); perr "$d" "$acct" "$prof" "$reg" "rds describe-db-clusters" "$e"; echo '{}' >"$d/c.json"; }
+    awsc "$d/i.json" "$prof" "$reg" rds describe-db-instances || { in_ok=0; e="$(err_of "$d/i.json")"; errs+=("describe-db-instances: $e"); (( cl_ok )) && perr "$d" "$acct" "$prof" "$reg" "rds describe-db-instances" "$e"; echo '{}' >"$d/i.json"; }
+    jqv -c '.DBClusters // []' "$d/c.json" >"$d/clusters.json"; jqv -c '.DBInstances // []' "$d/i.json" >"$d/instances.json"
+    nc="$(jqv length "$d/clusters.json")"; ni="$(jqv length "$d/instances.json")"; n=$((nc + ni))
     (( DRY_RUN )) && n=1
     if (( n > 0 )); then
-        awsc "$d/cs.json" "$prof" "$reg" rds describe-db-cluster-snapshots --filters Name=engine,Values=docdb,neptune \
-            || { csnap_ok=false; errs+=("describe-db-cluster-snapshots: $(err_of "$d/cs.json")"); echo '{}' >"$d/cs.json"; }
+        if (( cl_ok && in_ok )); then
+            if awsc "$d/pma.raw" "$prof" "$reg" rds describe-pending-maintenance-actions; then jqv -c '.PendingMaintenanceActions // []' "$d/pma.raw" >"$d/pma.json"
+            else perr "$d" "$acct" "$prof" "$reg" "rds describe-pending-maintenance-actions" "$(err_of "$d/pma.raw") (pending_actions shown as 0)"; echo '[]' >"$d/pma.json"; fi
+        fi
+        awsc "$d/cs.json" "$prof" "$reg" rds describe-db-cluster-snapshots --include-shared || { csnap_ok=false; errs+=("describe-db-cluster-snapshots: $(err_of "$d/cs.json")"); echo '{}' >"$d/cs.json"; }
+        awsc "$d/is.json" "$prof" "$reg" rds describe-db-snapshots --include-shared || { isnap_ok=false; errs+=("describe-db-snapshots: $(err_of "$d/is.json")"); echo '{}' >"$d/is.json"; }
         if awsc "$d/v.json" "$prof" "$reg" backup list-backup-vaults; then
             local v k=0
             while IFS= read -r v; do
@@ -222,17 +281,19 @@ scan_region() {   # scan_region <profile> <account> <region> <dir> -> <dir>/reso
                 awsc "$d/rp$k.json" "$prof" "$reg" backup list-recovery-points-by-backup-vault --backup-vault-name "$v" \
                     || { backup_ok=false; errs+=("list-recovery-points-by-backup-vault $v: $(err_of "$d/rp$k.json")"); echo '{}' >"$d/rp$k.json"; }
             done < <(jqv -r '.BackupVaultList[]?.BackupVaultName' "$d/v.json")
-            if (( k )); then jqv -s '[ .[].RecoveryPoints[]? | select(.ResourceArn // "" | test(":rds:")) ]' "$d"/rp[0-9]*.json >"$d/rp.json"; fi
+            if (( k )); then jqv -s '[ .[].RecoveryPoints[]? | select(.ResourceType == "Aurora" or .ResourceType == "RDS" or (.ResourceArn // "" | test(":rds:"))) ]' "$d"/rp[0-9]*.json >"$d/rp.json"; fi
         else backup_ok=false; errs+=("list-backup-vaults: $(err_of "$d/v.json")"); fi
+        (( cl_ok && in_ok )) && collect_versions "$prof" "$reg" "$d"
     fi
-    jqv -n --arg acct "$acct" --arg region "$reg" --slurpfile clusters "$d/c.json" --slurpfile csnaps "$d/cs.json" --slurpfile rps "$d/rp.json" \
-        --argjson csnap_ok "$csnap_ok" --argjson backup_ok "$backup_ok" -f "$LIBDIR/collect_docdb.jq" >"$d/resources.json"
-    local status; n="$(jqv length "$d/resources.json")"
-    if (( ${#errs[@]} )); then status=error; elif (( n > 0 )); then status="with databases"; else status=empty; fi
+    if (( cl_ok && in_ok && ! DRY_RUN )) && (( n > 0 )); then patch_rows "$prof" "$acct" "$reg" "$d" >"$d/rows.json"; fi
     for e in "${errs[@]}"; do log_warn "$acct $reg: $e"; done
-    region_progress "$reg" "$d/resources.json" "${errs[@]}"
-    jqv -n --arg a "$acct" --arg r "$reg" --arg s "$status" --argjson n "$n" --argjson e "$(json_array "${errs[@]}")" --argjson so "$csnap_ok" \
-        '{account: $a, region: $r, status: $s, resources: $n, errors: $e, snapshot_scan: $so, existing: null}' >"$d/region.json"
+    local st=databases; (( n == 0 )) && st=empty; (( cl_ok && in_ok )) || st=error
+    jqv -n --arg s "$st" --argjson e "$(json_array "${errs[@]}")" --argjson cs "$csnap_ok" --argjson is "$isnap_ok" --argjson bo "$backup_ok" \
+        --argjson nc "$nc" --argjson ni "$ni" --slurpfile c "$d/clusters.json" --slurpfile rp "$d/rp.json" --slurpfile x "$d/cs.json" --slurpfile y "$d/is.json" \
+        '{status: $s, errors: $e, csnap_ok: $cs, isnap_ok: $is, backup_ok: $bo, clusters: $nc, instances: $ni,
+          rds_clusters: ([$c[0][] | select(.Engine // "" | test("^(docdb|neptune)") | not)] | length),
+          snapshots: (([$x[0].DBClusterSnapshots[]?] | length) + ([$y[0].DBSnapshots[]?] | length)), recovery_points: ($rp[0] | length)}' >"$d/scan.json"
+    region_progress "$reg" "$d/scan.json"
     echo "$((AWS_CALLS - c0)) $((AWS_FAILS - f0))" >"$d/stats"
 }
 
@@ -243,33 +304,54 @@ region_job() {   # background job: scan_region in a subshell; <dir>/rc marks a n
 }
 
 region_failed() {   # placeholder result so the other regions still report
-    echo '[]' >"$3/resources.json"
-    jqv -n --arg a "$1" --arg r "$2" --arg e "region scan failed: $4" \
-        '{account: $a, region: $r, status: "error", resources: 0, errors: [$e], snapshot_scan: false, existing: null}' >"$3/region.json"
+    for f in clusters instances rows rp pma; do echo '[]' >"$3/$f.json"; done; for f in c i cs is; do echo '{}' >"$3/$f.json"; done
+    perr "$3" "$1" "$5" "$2" "region scan" "region scan failed: $4"
+    jqv -n --arg e "region scan failed: $4" '{status: "error", errors: [$e], csnap_ok: false, isnap_ok: false, backup_ok: false, clusters: 0, instances: 0, rds_clusters: 0, snapshots: 0, recovery_points: 0}' >"$3/scan.json"
 }
 
-region_progress() {   # one line per region with resources (every region with -v); errors always shown
-    local reg="$1" res="$2"; shift 2
-    local line secs=$(( SECONDS - ${REG_T0:-$SECONDS} ))
-    line="$(jqv -r '([.[] | select(.engine | startswith("docdb"))] | length) as $d | ([.[] | select(.engine | startswith("neptune"))] | length) as $n
-        | ([.[].snapshots[]? | select(.kind != "backup")] | length) as $s | ([.[].snapshots[]? | select(.kind == "backup")] | length) as $b
-        | if $d + $n == 0 then "(empty)"
-          else "\($d) DocumentDB + \($n) Neptune cluster\(if $d + $n == 1 then "" else "s" end), \($s) snapshot\(if $s == 1 then "" else "s" end), \($b) recovery point\(if $b == 1 then "" else "s" end)" end' "$res")" || true
-    [[ -n "$line" ]] || line="failed: unreadable AWS output"
-    [[ "$line" == "(empty)" && $# -eq 0 && "$VERBOSE" != 1 ]] && return 0
-    [[ "$line" == "(empty)" ]] || line+=" (${secs}s)"
-    if (( $# )); then line+=" - ERROR: $(IFS='; '; echo "$*")"; [[ "$line" == *"(empty)"* ]] && line="${line/(empty)/(no data)}"; fi
+plural() { if (( $1 == 1 )); then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi; }
+region_progress() {   # one line per region with databases (every region with -v); errors always shown
+    local reg="$1" s="$2" line nc ni sn rp ne secs=$(( SECONDS - ${REG_T0:-$SECONDS} ))
+    read -r nc ni sn rp ne < <(jqv -r '"\(.clusters) \(.instances) \(.snapshots) \(.recovery_points) \(.errors | length)"' "$s") || true
+    if [[ -z "$ne" ]]; then line="failed: unreadable AWS output"
+    elif (( nc + ni == 0 )); then (( ne == 0 && VERBOSE != 1 )) && return 0; line="(empty)"; (( ne )) && line="(no data)"
+    else line="$(plural "$nc" cluster), $(plural "$ni" instance), $(plural "$sn" snapshot), $(plural "$rp" "recovery point") (${secs}s)"; fi
+    (( ${ne:-0} )) && line+=" - ERROR: $(jqv -r '.errors | join("; ")' "$s")"
     log_info "[$REG_I/$REG_N] $reg: $line"
 }
 
-region_summary() {   # "17 regions scanned, 15 empty: a, b, c" (+ failed regions)
-    log_info "$1: $(jqv -rs '(map(select(.status == "empty") | .region)) as $e | (map(select(.status == "error") | .region)) as $f
-        | "\(length) region\(if length == 1 then "" else "s" end) scanned, \(map(.resources) | add) DocumentDB/Neptune cluster(s), \($e | length) empty\(if ($e | length) > 0 then ": " + ($e | join(", ")) else "" end)"
-          + (if ($f | length) > 0 then "; \($f | length) failed: \($f | join(", "))" else "" end)' "$WORK/$1"/*/region.json)"
+region_summary() {   # "5 regions scanned, 18 clusters, 37 instances, 2 empty: a, b" (+ failed regions)
+    log_info "$1: $(jqv -rs --argjson n "$2" '(map(select(.status == "empty") | .region)) as $e | (map(select(.status == "error") | .region)) as $f
+        | (map(.clusters) | add) as $c | (map(.instances) | add) as $i
+        | "\(length) region\(if length == 1 then "" else "s" end) scanned, \($c) cluster\(if $c == 1 then "" else "s" end), \($i) instance\(if $i == 1 then "" else "s" end), \($e | length) empty\(if ($e | length) > 0 then ": " + ($e | join(", ")) else "" end)"
+          + (if ($f | length) > 0 then "; \($f | length) failed: \($f | join(", "))" else "" end)' "$WORK/$1"/*/rs.json)"
+}
+
+build_region() {   # build_region <account> <region> <dir> <globals-file> <global_ok> [extra error]: backup + DocumentDB/Neptune results, 0 AWS calls
+    local a="$1" r="$2" d="$3" gf="$4" gok="$5" st n no; local s="$d/scan.json"
+    if [[ -n "${6:-}" ]]; then jqv --arg e "$6" '.errors += [$e]' "$s" >"$s.t" && mv "$s.t" "$s"; fi
+    local cs is bo; read -r cs is bo < <(jqv -r '"\(.csnap_ok) \(.isnap_ok) \(.backup_ok)"' "$s")
+    # rds-backup-compliance lib/collect.jq (skips DocumentDB / Neptune)
+    jqv -n --arg acct "$a" --arg region "$r" --slurpfile clusters "$d/c.json" --slurpfile instances "$d/i.json" \
+        --slurpfile csnaps "$d/cs.json" --slurpfile isnaps "$d/is.json" --slurpfile rps "$d/rp.json" --slurpfile globals "$gf" \
+        --argjson csnap_ok "$cs" --argjson isnap_ok "$is" --argjson backup_ok "$bo" --argjson global_ok "$gok" -f "$LIBDIR/backup_collect.jq" >"$d/coll.json"
+    jqv '.resources' "$d/coll.json" >"$d/resources.json"; jqv '.orphans' "$d/coll.json" >"$d/orphans.json"
+    n="$(jqv length "$d/resources.json")"; no="$(jqv length "$d/orphans.json")"
+    if [[ "$(jqv '.errors | length' "$s")" != 0 ]]; then st=error; elif (( n > 0 )); then st="with databases"; elif (( no > 0 )); then st="snapshots only"; else st=empty; fi
+    jqv -n --arg a "$a" --arg r "$r" --arg s "$st" --argjson n "$n" --slurpfile x "$s" --slurpfile c "$d/coll.json" \
+        '{account: $a, region: $r, status: $s, resources: $n, errors: $x[0].errors, snapshot_scan: ($x[0].csnap_ok and $x[0].isnap_ok), existing: $c[0].existing}' >"$d/region.json"
+    # DocumentDB / Neptune (v1.0 lib/collect_docdb.jq)
+    jqv -n --arg acct "$a" --arg region "$r" --slurpfile clusters "$d/c.json" --slurpfile csnaps "$d/cs.json" --slurpfile rps "$d/rp.json" \
+        --argjson csnap_ok "$cs" --argjson backup_ok "$bo" -f "$LIBDIR/collect_docdb.jq" >"$d/dres.json"
+    n="$(jqv length "$d/dres.json")"
+    if [[ "$(jqv '.errors | length' "$s")" != 0 ]]; then st=error; elif (( n > 0 )); then st="with databases"; else st=empty; fi
+    jqv -n --arg a "$a" --arg r "$r" --arg s "$st" --argjson n "$n" --slurpfile x "$s" \
+        '{account: $a, region: $r, status: $s, resources: $n, errors: $x[0].errors, snapshot_scan: $x[0].csnap_ok, existing: null}' >"$d/dregion.json"
+    jqv -n --arg a "$a" --arg r "$r" --slurpfile x "$s" '{account: $a, region: $r, status: $x[0].status, servers: ($x[0].clusters + $x[0].instances), instances: $x[0].instances, clusters: $x[0].clusters}' >"$d/rs.json"
 }
 
 scan_profile() {   # scan_profile <profile> -> $WORK/data_<account>.json
-    local prof="$1" acct reg d i=0 st idf="$WORK/id_${1:-default}.json"; local -a regs=()
+    local prof="$1" acct reg d i=0 st idf="$WORK/id_${1:-default}.json" c_acct=$AWS_CALLS f_acct=$AWS_FAILS; local -a regs=()
     if (( DRY_RUN )); then acct="ACCOUNT"; awsc "$idf" "$prof" "" sts get-caller-identity
     else
         awsc "$idf" "$prof" "" sts get-caller-identity || { log_error "profile '${prof:-default}': no valid credentials ($(err_of "$idf"))"; return 1; }
@@ -291,7 +373,7 @@ scan_profile() {   # scan_profile <profile> -> $WORK/data_<account>.json
     fi
     local n=${#regs[@]} par=$PARALLEL running=0
     (( DRY_RUN || n < 2 )) && par=1
-    log_info "$acct (${prof:-default}): scanning $n region(s) for DocumentDB / Neptune${par:+, up to $par at a time}"
+    log_info "$acct (${prof:-default}): scanning $(plural "$n" region) for patch + backup data, up to $par at a time"
     for reg in "${regs[@]}"; do
         i=$((i + 1)); printf -v d '%s/%s/%04d' "$WORK" "$acct" "$i"; mkdir -p "$d"; REG_I=$i; REG_N=$n; REG_T0=$SECONDS
         if (( par == 1 )); then scan_region "$prof" "$acct" "$reg" "$d"; echo 0 >"$d/rc"; continue; fi
@@ -300,39 +382,99 @@ scan_profile() {   # scan_profile <profile> -> $WORK/data_<account>.json
         fi
         region_job "$prof" "$acct" "$reg" "$d" & BG_PIDS+=("$!"); running=$((running + 1))
     done
-    (( DRY_RUN )) && return 0
-    if (( par > 1 )); then
-        wait || true; BG_PIDS=()
-        local fails=0 c f; i=0
-        for reg in "${regs[@]}"; do   # combine in region order: per-region files only, no shared writes
-            i=$((i + 1)); printf -v d '%s/%s/%04d' "$WORK" "$acct" "$i"
+    if (( par > 1 )); then wait || true; BG_PIDS=(); fi
+    local fails=0 c f gi=0 gf="$WORK/$acct/globals.json" gok=true gst=not-needed gmsg="" gn=0 greg="${regs[0]}"; i=0
+    for reg in "${regs[@]}"; do   # in region order: per-region files only, no shared writes
+        i=$((i + 1)); printf -v d '%s/%s/%04d' "$WORK" "$acct" "$i"
+        if (( par > 1 )); then
             st="$(cat "$d/rc" 2>/dev/null || echo killed)"
-            if [[ "$st" != 0 || ! -s "$d/region.json" || ! -s "$d/resources.json" ]]; then
+            if [[ "$st" != 0 || ! -s "$d/scan.json" || ! -s "$d/rows.json" ]]; then
                 [[ "$st" == 0 ]] && st="0, incomplete result"
-                fails=$((fails + 1)); log_error "[$i/$n] $reg: failed (exit $st)"; region_failed "$acct" "$reg" "$d" "exit $st"
+                fails=$((fails + 1)); log_error "[$i/$n] $reg: failed (exit $st)"; region_failed "$acct" "$reg" "$d" "exit $st" "$prof"
             fi
             if [[ -s "$d/stats" ]]; then read -r c f <"$d/stats"; AWS_CALLS=$((AWS_CALLS + c)); AWS_FAILS=$((AWS_FAILS + f)); fi
-        done
-        (( fails )) && log_warn "$acct: $fails of $n region(s) failed"
+        fi
+        (( gi == 0 )) && [[ "$(jqv .rds_clusters "$d/scan.json")" != 0 ]] && { gi=$i; greg="$reg"; }
+    done
+    (( fails )) && log_warn "$acct: $fails of $n region(s) failed"
+    # Aurora global databases: one describe-global-clusters per account, shared by the patch and the backup data
+    echo '{}' >"$gf"
+    if (( gi || DRY_RUN )); then
+        if awsc "$gf" "$prof" "$greg" rds describe-global-clusters; then gst=ok; gn="$(jqv '.GlobalClusters // [] | length' "$gf")"
+        else gok=false; gst=error; gmsg="$(err_of "$gf")"; echo '{}' >"$gf"; log_warn "$acct $greg: describe-global-clusters: $gmsg (Aurora clusters show global database \"unknown\")"; fi
     fi
-    region_summary "$acct"
+    (( DRY_RUN )) && return 0
+    cat "$WORK/$acct"/*/rows.json | jqv -s 'add // [] | any(.[]; .resource_type == "aurora-cluster")' | grep -q true || { gst=not-needed; gmsg=""; }
+    i=0
+    for reg in "${regs[@]}"; do
+        i=$((i + 1)); printf -v d '%s/%s/%04d' "$WORK" "$acct" "$i"
+        local extra=""; [[ $i == "$gi" && "$gok" == false ]] && extra="describe-global-clusters: $gmsg"
+        build_region "$acct" "$reg" "$d" "$gf" "$gok" "$extra"
+    done
+    local nserv; nserv="$(cat "$WORK/$acct"/*/rs.json | jqv -s 'map(.servers) | add // 0')"
+    region_summary "$acct" "$nserv"
+    local calls=$((AWS_CALLS - c_acct)) utc gu gl; utc="$(jqv -rn --argjson e "$NOW" '$e | todate')"
+    gu="$(date -u -d "@$NOW" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "$utc")"; gl="$(TZ="$DISPLAY_TZ" date -d "@$NOW" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo "$utc")"
+    cat "$WORK/$acct"/*/perr.jsonl >"$WORK/$acct/perr.all"
+    # patch: the rds-patch-compliance --save-data document (schema rds_patch_compliance_data 1.1)
+    jqv -n --arg s "$PATCH_SCHEMA" --arg tool "$SCRIPT_VERSION" --arg a "$acct" --arg p "${prof:-default}" --argjson now "$NOW" --arg utc "$utc" \
+        --arg gu "$gu" --arg gl "$gl" --arg tz "$DISPLAY_TZ" --arg abbr "$TZ_LABEL" --argjson off "$TZ_OFFSET" --argjson calls "$calls" \
+        --arg rmode "$( (( ALL_REGIONS )) && echo discover || echo explicit)" --argjson par "$PARALLEL" --argjson lc "$( [[ -e "$WORK/lc_unsupported" ]] && echo false || echo true)" \
+        --arg greg "$greg" --arg gst "$gst" --arg gmsg "$gmsg" --argjson gn "$gn" --slurpfile g "$gf" \
+        --slurpfile rs <(cat "$WORK/$acct"/*/rs.json) --slurpfile rows <(cat "$WORK/$acct"/*/rows.json) --slurpfile errs "$WORK/$acct/perr.all" \
+        '($rows | add // []) as $R
+        | {schema: $s, schema_version: 1, schema_minor: 1, script_version: $tool, collected_epoch: $now, collected_at: $utc,
+           collected_utc: $gu, collected_local: $gl, tz: $tz, tz_abbr: $abbr, tz_offset: $off, read_only: "describe calls + sts get-caller-identity only",
+           accounts: [{account: $a, profile: $p, collected_epoch: $now, collected_at: $utc}],
+           settings: {max_behind: 2, warn_days: 180, filters: {engines: [], identifiers: []}, oracle_any_patch_line: false,
+                      region_discovery: {mode: $rmode, probe_parallel: (if $rmode == "discover" then $par else null end)}, lifecycle_api: $lc, aws_calls: $calls},
+           regions: ([$R[].region] | unique),
+           region_status: [$rs[] | {account, profile: $p, region, status: (if .status == "error" then "probe-error" else .status end),
+                                    probe_instances: .instances, probe_clusters: .clusters}],
+           globals: (if $gst == "ok" then [($g[0].GlobalClusters // [])[] | {account: $a, id: .GlobalClusterIdentifier, arn: .GlobalClusterArn, engine: (.Engine // ""),
+                      version: (.EngineVersion // ""), status: (.Status // ""),
+                      members: [(.GlobalClusterMembers // [])[] | {arn: .DBClusterArn, region: (.DBClusterArn | split(":")[3]),
+                                cluster: (.DBClusterArn | split(":")[-1]), role: (if .IsWriter then "primary" else "secondary" end)}]}] else [] end),
+           global_lookup: [{account: $a, profile: $p, region: $greg, status: $gst, message: $gmsg, count: (if $gst == "ok" then $gn else 0 end)}],
+           rows: $R, errors: $errs}' >"$WORK/p_$acct.json"
+    # backup: the rds-backup-compliance --save-data document; docdb: DocumentDB / Neptune (same format)
+    local kind
+    for kind in backup docdb; do
+        local rf=region.json rsf=resources.json of=orphans.json sch="$BACKUP_SCHEMA" scope=null
+        [[ $kind == docdb ]] && { rf=dregion.json; rsf=dres.json; of=""; sch="$DATA_SCHEMA"; scope='"docdb,neptune"'; }
+        jqv -n --arg s "$sch" --arg tool "$SCRIPT_VERSION" --arg a "$acct" --arg p "${prof:-default}" --argjson now "$NOW" --argjson scope "$scope" \
+            --slurpfile regs <(cat "$WORK/$acct"/*/"$rf") --slurpfile res <(cat "$WORK/$acct"/*/"$rsf") --slurpfile orph <(if [[ -n "$of" ]]; then cat "$WORK/$acct"/*/"$of"; fi) \
+            '{schema: $s, schema_version: 1, tool_version: $tool} + (if $scope then {scope: $scope} else {} end)
+             + {collected_epoch: $now, collected_at: ($now | todate), accounts: [{account: $a, profile: $p, collected_epoch: $now}],
+                regions: $regs, resources: [$res[][] | del(.arn)], orphans: [$orph[][]?]}' >"$WORK/${kind}_$acct.json"
+    done
     jqv -n --arg s "$DATA_SCHEMA" --argjson v "$DATA_SCHEMA_VERSION" --arg tool "$SCRIPT_VERSION" --arg a "$acct" --arg p "${prof:-default}" --argjson now "$NOW" \
-        '{schema: $s, schema_version: $v, tool_version: $tool, scope: "docdb,neptune", collected_epoch: $now, collected_at: ($now | todate),
-          accounts: [{account: $a, profile: $p, collected_epoch: $now}], regions: [ inputs ], resources: [], orphans: []}' "$WORK/$acct"/*/region.json >"$WORK/hdr_$acct.json"
-    jqv -s '.[0] + {resources: [ .[1:][][] ]}' "$WORK/hdr_$acct.json" "$WORK/$acct"/*/resources.json >"$WORK/data_$acct.json"
+        --arg tz "$DISPLAY_TZ" --argjson calls "$calls" --argjson fails "$((AWS_FAILS - f_acct))" \
+        --slurpfile P "$WORK/p_$acct.json" --slurpfile B "$WORK/backup_$acct.json" --slurpfile D "$WORK/docdb_$acct.json" \
+        '{schema: $s, schema_version: $v, tool_version: $tool, collected_epoch: $now, collected_at: ($now | todate), tz: $tz,
+          read_only: "describe / list calls + sts get-caller-identity only", aws_calls: $calls, aws_failures: $fails,
+          accounts: [{account: $a, profile: $p, collected_epoch: $now}], patch: $P[0], backup: $B[0], docdb: $D[0]}' >"$WORK/data_$acct.json"
+    log_info "$acct: $(jqv -r '"patch \(.patch.rows | length) server\(if (.patch.rows | length) == 1 then "" else "s" end), backup \(.backup.resources | length) RDS/Aurora + \(.docdb.resources | length) DocumentDB/Neptune, \(.aws_calls) AWS calls"' "$WORK/data_$acct.json")"
     DATA_FILES+=("$WORK/data_$acct.json")
 }
+
 
 # ---------------------------------------------------------------------------- merge input (0 AWS calls)
 winpath() { local p="$1"; [[ -e "$p" ]] && { printf '%s' "$p"; return; }
             command -v cygpath >/dev/null 2>&1 && { cygpath -u -- "$p" 2>/dev/null | tr -d '\r'; return; }; printf '%s' "$p"; }
 schema_of() { jq -r 'if type == "object" and (.schema | type) == "string" then .schema else "" end' -- "$1" 2>/dev/null | tr -d '\r' || true; }
-declare -a PFILES=() BFILES=() DFILES=()
+declare -a PFILES=() BFILES=() DFILES=(); NIN=0
 add_input() {   # add_input <file> <strict 0|1>
     local s; s="$(schema_of "$1")"
     case "$s" in
-        "$PATCH_SCHEMA") PFILES+=("$1") ;; "$BACKUP_SCHEMA") BFILES+=("$1") ;; "$DATA_SCHEMA") DFILES+=("$1") ;;
-        *) if (( $2 )); then die 3 "Not a patch, backup or DocumentDB/Neptune --save-data file (or unreadable JSON): $1"; fi
+        "$PATCH_SCHEMA") PFILES+=("$1") ;; "$BACKUP_SCHEMA") BFILES+=("$1") ;;
+        "$DATA_SCHEMA")
+            if [[ "$(jqv -r '(.schema_version // 1) >= 2 and (.patch | type) == "object"' -- "$1" 2>/dev/null)" == true ]]; then
+                local x="$WORK/in/$(( ${#PFILES[@]} + ${#BFILES[@]} + ${#DFILES[@]} ))"; mkdir -p "$x"   # same file name: patch warnings name it
+                { jqv .patch -- "$1" >"$x/p" && jqv .backup -- "$1" >"$x/b" && jqv .docdb -- "$1" >"$x/d"; } || die 3 "Unreadable: $1"
+                mkdir -p "$x/p_" && mv "$x/p" "$x/p_/${1##*/}"; PFILES+=("$x/p_/${1##*/}"); BFILES+=("$x/b"); DFILES+=("$x/d")
+            else DFILES+=("$1"); fi ;;
+        *) if (( $2 )); then die 3 "Not an rds_compliance --save-data file (or unreadable JSON): $1"; fi
            log_warn "skipping $1 (not a --save-data file)"; return 1 ;;
     esac
 }
@@ -342,12 +484,12 @@ collect_merge_inputs() {
         p="$(winpath "$a")"
         if [[ -d "$p" ]]; then
             found=0
-            for f in "$p"/*.json; do [[ -e "$f" ]] || continue; add_input "$f" 0 && found=1; done
+            for f in "$p"/*.json; do [[ -e "$f" ]] || continue; add_input "$f" 0 && { found=1; NIN=$((NIN + 1)); }; done
             (( found )) || die 3 "No --save-data files in directory: $a"
-        elif [[ -f "$p" ]]; then add_input "$p" 1
+        elif [[ -f "$p" ]]; then add_input "$p" 1; NIN=$((NIN + 1))
         else die 3 "Merge input not found: $a"; fi
     done
-    log_info "inputs: ${#PFILES[@]} patch, ${#BFILES[@]} backup, ${#DFILES[@]} DocumentDB/Neptune file(s)"
+    log_info "inputs: $(plural "$NIN" file)"
     local i=0 parts=()
     # patch: rds-patch-compliance lib/merge.jq (newest collection per account wins; status recomputed with --max-behind)
     : >"$WORK/p_in.jsonl"
@@ -401,9 +543,10 @@ render() {   # render <mode> -> stdout
 write_out() { local f="$1"; shift; "$@" >"$f" || die 4 "Cannot write $f"; WRITTEN+=("$f"); }
 
 main() {
+    if (( $# == 0 )); then usage; exit 1; fi
     parse_args "$@"
     command -v jq >/dev/null 2>&1 || die 2 "jq not found"
-    local f; for f in backup.jq backup_merge.jq patch_merge.jq versions.jq collect_docdb.jq report.jq page.js page.css; do
+    local f; for f in backup.jq backup_merge.jq backup_collect.jq patch_merge.jq patch_compliance.jq versions.jq collect_docdb.jq report.jq page.js page.css; do
         [[ -r "$LIBDIR/$f" ]] || die 2 "Missing $LIBDIR/$f - keep the lib/ folder next to the script"; done
     (( MERGE )) || (( DRY_RUN )) || command -v aws >/dev/null 2>&1 || die 2 "aws CLI not found"
     NOW="${RDS_CR_NOW:-$(date -u +%s)}"; STAMP="$(date -u -d "@$NOW" +%Y%m%d_%H%M%S 2>/dev/null || date -u +%Y%m%d_%H%M%S)"; tz_setup; CFG="$(cfg_json)"

@@ -1,112 +1,114 @@
 #!/usr/bin/env python3
-# Mock aws CLI for the DocumentDB / Neptune collector tests. Data is relative to MOCK_NOW (epoch, default: now).
-# MOCK_LOG=file appends every call; MOCK_SCENARIO: fleet (default) | empty | backupdeny | regionfail
-import json, os, sys
-from datetime import datetime, timedelta, timezone
+"""Stub `aws` for rds_compliance_report.sh tests. No network code; never talks to AWS.
 
-a = sys.argv[1:]
-NOW = datetime.fromtimestamp(int(os.environ.get("MOCK_NOW") or datetime.now(timezone.utc).timestamp()), timezone.utc)
-SCEN = os.environ.get("MOCK_SCENARIO", "fleet")
+One consistent fleet built from three sub-mocks (copies of the sibling repos' test mocks, plus the DocumentDB / Neptune mock):
+  sub/patch_mock.py  (rds-patch-compliance)  instances, clusters, pending maintenance, engine versions, lifecycle, global clusters
+  sub/backup_mock.py (rds-backup-compliance) instances, clusters, snapshots, AWS Backup vaults / recovery points, global clusters
+  sub/docdb_mock.py  (this repo, v1.0)       DocumentDB / Neptune clusters, snapshots, recovery points
+describe-db-clusters / -instances are the union (same identifier: fields merged, patch-mock fields win), so the sibling tools
+and this script see the same data. The --query length(...) probe of rds-patch-compliance -A is answered here.
+Profiles: prod -> 111111111111, nonprod -> 222222222222 (default: prod). Regions: us-east-1 us-west-2 ap-south-1 eu-west-1 ca-central-1.
+MOCK_SCENARIO: fleet | empty | backupdeny | regionfail (us-west-2 describe-db-clusters AccessDenied) | any sub-mock scenario.
+MOCK_NOW: fixed epoch.  MOCK_LOG: append argv as JSONL (one line per call to this mock).
+"""
+import json, os, subprocess, sys
+
+HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sub")
+argv = sys.argv[1:]
 if os.environ.get("MOCK_LOG"):
-    with open(os.environ["MOCK_LOG"], "a") as f:
-        f.write(" ".join(a) + "\n")
+    with open(os.environ["MOCK_LOG"], "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+if argv[:1] == ["--version"]:
+    print("aws-cli/2.38.6.mock Python/3 Linux"); sys.exit(0)
+SCEN = os.environ.get("MOCK_SCENARIO", "fleet")
 
 
 def opt(name, default=None):
-    return a[a.index(name) + 1] if name in a else default
+    return argv[argv.index(name) + 1] if name in argv else default
 
 
-svc, op = (a + ["", ""])[0:2]
-region = opt("--region", "us-east-1")
-prof = opt("--profile", "default")
-acct = {"prod": "111111111111", "dev": "222222222222"}.get(prof, "111111111111")
+def fail(code, op, msg):
+    sys.stderr.write("\naws: [ERROR]: An error occurred (%s) when calling the %s operation: %s\n\n" % (code, op, msg)); sys.exit(254)
 
 
-def iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-
-def fail(code, opn, msg):
-    sys.stderr.write("\nAn error occurred (%s) when calling the %s operation: %s\n" % (code, opn, msg)); sys.exit(254)
-
-
-# id, engine, version, region, age days, retention, weekly?, monthly?, replica source
-FLEET = {"111111111111": [
-    ("catalog-docdb", "docdb", "5.0.0", "us-east-1", 900, 7, True, True, None),
-    ("graph-neptune", "neptune", "1.3.2.1", "us-east-1", 900, 1, False, False, None),
-    ("new-docdb", "docdb", "5.0.0", "us-east-1", 2, 7, False, False, None),
-    ("catalog-docdb-dr", "docdb", "5.0.0", "us-west-2", 400, 7, False, False, "arn:aws:rds:us-east-1:111111111111:cluster:catalog-docdb"),
-], "222222222222": [("dev-docdb", "docdb", "4.0.0", "ap-south-1", 500, 7, True, False, None)]}
-rows = [] if SCEN == "empty" else [r for r in FLEET[acct] if r[3] == region]
-if SCEN == "regionfail" and region == "us-west-2" and svc == "rds":
+if argv[:3] == ["configure", "get", "region"]:
+    r = os.environ.get("MOCK_DEFAULT_REGION", "")
+    print(r) if r else None; sys.exit(0 if r else 1)
+VAL = {"--output", "--profile", "--region", "--cli-connect-timeout", "--cli-read-timeout", "--filters", "--max-records", "--query",
+       "--engine", "--engine-version", "--backup-vault-name", "--starting-token", "--page-size", "--max-items"}
+pos, i = [], 0
+while i < len(argv):
+    if argv[i] in VAL: i += 2; continue
+    if not argv[i].startswith("--"): pos.append(argv[i])
+    i += 1
+svc, op = (pos + ["", ""])[:2]
+profile = opt("--profile", os.environ.get("AWS_PROFILE", "prod"))
+region = opt("--region", os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")))
+ACCT = {"prod": "111111111111", "nonprod": "222222222222"}
+if profile not in ACCT:
+    fail("InvalidClientTokenId", "GetCallerIdentity", "The security token included in the request is invalid.")
+acct = ACCT[profile]
+if svc == "sts":
+    print(json.dumps({"UserId": "AIDAMOCK", "Account": acct, "Arn": "arn:aws:iam::%s:user/dba" % acct})); sys.exit(0)
+if svc == "ec2" and op == "describe-regions":
+    print(json.dumps({"Regions": [{"RegionName": r, "Endpoint": "ec2.%s.amazonaws.com" % r, "OptInStatus": "opt-in-not-required"}
+                                  for r in ["us-east-1", "us-west-2", "ap-south-1", "eu-west-1", "ca-central-1"]]})); sys.exit(0)
+if SCEN == "regionfail" and region == "us-west-2" and op == "describe-db-clusters":
     fail("AccessDenied", "DescribeDBClusters", "User is not authorized to perform: rds:DescribeDBClusters")
 
 
-def arn(r):
-    return "arn:aws:rds:%s:%s:cluster:%s" % (r[3], acct, r[0])
+def sub(name, args, prof=None):
+    env = dict(os.environ); env.pop("MOCK_LOG", None)
+    if name == "docdb_mock.py" and SCEN not in ("fleet", "empty", "backupdeny"): env["MOCK_SCENARIO"] = "fleet"
+    if name == "patch_mock.py" and SCEN in ("backupdeny", "regionfail", "snapdeny", "globaldeny", "rpquirks"): env["MOCK_SCENARIO"] = "fleet"
+    a = [svc, op] + args + ["--output", "json", "--region", region, "--profile", prof or profile]
+    if name == "patch_mock.py": a.append("--no-cli-pager")
+    p = subprocess.run([sys.executable, os.path.join(HERE, name)] + a, capture_output=True, text=True, env=env)
+    if p.returncode:
+        sys.stderr.write(p.stderr); sys.exit(p.returncode)
+    return json.loads(p.stdout or "{}")
 
 
-def created(r):
-    return (NOW - timedelta(days=r[4])).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def saturdays(n):
-    d = NOW.replace(hour=5, minute=0, second=0, microsecond=0) - timedelta(days=(NOW.weekday() - 5) % 7)
-    if d > NOW: d -= timedelta(days=7)
-    return [d - timedelta(days=7 * k) for k in range(n)]
-
-
-def first_sundays(n):
-    out, y, m = [], NOW.year, NOW.month
-    while len(out) < n:
-        d = datetime(y, m, 1, 4, 0, tzinfo=timezone.utc)
-        d += timedelta(days=(6 - d.weekday()) % 7)
-        if d <= NOW: out.append(d)
-        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
-    return out
-
-
-if svc == "sts":
-    print(json.dumps({"Account": acct, "Arn": "arn:aws:iam::%s:user/mock" % acct})); sys.exit(0)
-if svc == "ec2" and op == "describe-regions":
-    print(json.dumps({"Regions": [{"RegionName": r} for r in ["us-east-1", "us-west-2", "ap-south-1", "eu-west-1"]]})); sys.exit(0)
-if svc == "rds" and op == "describe-db-clusters":
-    out = [{"DBClusterIdentifier": r[0], "DBClusterArn": arn(r), "Engine": r[1], "EngineVersion": r[2], "Status": "available",
-            "BackupRetentionPeriod": r[5], "ClusterCreateTime": iso(created(r)), "PreferredBackupWindow": "03:00-03:30",
-            "CopyTagsToSnapshot": True, **({"ReplicationSourceIdentifier": r[8]} if r[8] else {})} for r in rows]
-    if region == "us-east-1" and rows:   # Aurora must be ignored by the collector (rds-backup-compliance covers it)
-        out.append({"DBClusterIdentifier": "orders-aurora-pg15", "DBClusterArn": "arn:aws:rds:us-east-1:%s:cluster:orders-aurora-pg15" % acct,
-                    "Engine": "aurora-postgresql", "EngineVersion": "15.8", "BackupRetentionPeriod": 7, "ClusterCreateTime": iso(NOW)})
-    print(json.dumps({"DBClusters": out})); sys.exit(0)
+DOC_PROF = {"prod": "prod", "nonprod": "dev"}[profile]
+if svc == "rds" and op in ("describe-db-clusters", "describe-db-instances"):
+    key, idk = ("DBClusters", "DBClusterIdentifier") if op == "describe-db-clusters" else ("DBInstances", "DBInstanceIdentifier")
+    parts = [sub("backup_mock.py", []).get(key, []), sub("patch_mock.py", []).get(key, [])]
+    if key == "DBClusters": parts.insert(0, sub("docdb_mock.py", [], DOC_PROF).get(key, []))
+    merged, order = {}, []
+    for lst in parts:
+        for x in lst:
+            k = x.get(idk)
+            if k not in merged: merged[k] = {}; order.append(k)
+            merged[k].update(x)
+    items = [merged[k] for k in order]
+    if "--query" in argv:   # rds-patch-compliance -A probe: length(DBInstances) / length(DBClusters), first 20
+        print(min(len(items), int(opt("--max-records", "100")))); sys.exit(0)
+    print(json.dumps({key: items})); sys.exit(0)
 if svc == "rds" and op == "describe-db-cluster-snapshots":
-    out = []
-    for r in rows:
-        for k in range(r[5]):
-            t = NOW - timedelta(hours=2 + 24 * k)
-            if t < created(r): break
-            out.append({"DBClusterIdentifier": r[0], "DBClusterSnapshotIdentifier": "rds:%s-%s" % (r[0], t.strftime("%Y-%m-%d-%H-%M")),
-                        "SnapshotType": "automated", "SnapshotCreateTime": iso(t), "Status": "available", "AllocatedStorage": 0, "Engine": r[1]})
-    print(json.dumps({"DBClusterSnapshots": out})); sys.exit(0)
+    a = sub("backup_mock.py", ["--include-shared"]).get("DBClusterSnapshots", [])
+    print(json.dumps({"DBClusterSnapshots": a + sub("docdb_mock.py", [], DOC_PROF).get("DBClusterSnapshots", [])})); sys.exit(0)
+if svc == "rds" and op == "describe-db-snapshots":
+    print(json.dumps(sub("backup_mock.py", ["--include-shared"]))); sys.exit(0)
 if svc == "backup" and op == "list-backup-vaults":
-    if SCEN == "backupdeny":
-        fail("AccessDeniedException", "ListBackupVaults", "User is not authorized to perform: backup:ListBackupVaults")
-    print(json.dumps({"BackupVaultList": [{"BackupVaultName": n} for n in ["Default", "prod vault"]]})); sys.exit(0)
+    v = sub("backup_mock.py", []).get("BackupVaultList", [])
+    names = {x["BackupVaultName"] for x in v}
+    v += [x for x in sub("docdb_mock.py", [], DOC_PROF).get("BackupVaultList", []) if x["BackupVaultName"] not in names]
+    print(json.dumps({"BackupVaultList": v})); sys.exit(0)
 if svc == "backup" and op == "list-recovery-points-by-backup-vault":
-    pts = []
-    def rp(r, t, days, rule):
-        return {"RecoveryPointArn": "arn:aws:rds:%s:%s:cluster-snapshot:awsbackup:job-%s-%d" % (r[3], acct, r[0], int(t.timestamp())),
-                "BackupVaultName": opt("--backup-vault-name"), "ResourceArn": arn(r), "ResourceType": "DocumentDB" if r[1] == "docdb" else "Neptune",
-                "CreationDate": iso(t), "Status": "COMPLETED", "BackupSizeInBytes": 10737418240,
-                "CalculatedLifecycle": {"DeleteAt": iso(t + timedelta(days=days))}, "Lifecycle": {"DeleteAfterDays": days},
-                "CreatedBy": {"BackupPlanId": "p1", "BackupPlanName": "docdb-plan", "BackupRuleId": "r-" + rule, "BackupRuleName": rule}}
-    if opt("--backup-vault-name") == "prod vault":
-        for r in rows:
-            if r[6]:
-                pts += [rp(r, t, 30, "weekly-sat") for t in saturdays(6) if t > created(r) and t + timedelta(days=30) > NOW]
-            if r[7]:
-                pts += [rp(r, t, 365, "monthly-first-sun") for t in first_sundays(13) if t > created(r) and t + timedelta(days=365) > NOW]
-    elif rows:
-        pts.append({"RecoveryPointArn": "arn:aws:ec2:%s::image/ami-0abc" % region, "ResourceArn": "arn:aws:ec2:%s:%s:instance/i-0abc" % (region, acct),
-                    "ResourceType": "EC2", "CreationDate": iso(NOW), "Status": "COMPLETED"})
-    print(json.dumps({"RecoveryPoints": pts})); sys.exit(0)
-fail("InvalidAction", op, "mock: unsupported call %s %s" % (svc, op))
+    n = opt("--backup-vault-name")
+    rp = sub("backup_mock.py", ["--backup-vault-name", n]).get("RecoveryPoints", []) + sub("docdb_mock.py", ["--backup-vault-name", n], DOC_PROF).get("RecoveryPoints", [])
+    seen, out = set(), []
+    for x in rp:
+        if x["RecoveryPointArn"] not in seen: seen.add(x["RecoveryPointArn"]); out.append(x)
+    print(json.dumps({"RecoveryPoints": out})); sys.exit(0)
+if svc == "rds" and op == "describe-global-clusters":
+    g = {}
+    for x in sub("backup_mock.py", []).get("GlobalClusters", []) + sub("patch_mock.py", []).get("GlobalClusters", []):
+        g.setdefault(x["GlobalClusterIdentifier"], {}).update(x)
+    print(json.dumps({"GlobalClusters": list(g.values())})); sys.exit(0)
+if (svc, op) in (("rds", "describe-pending-maintenance-actions"), ("rds", "describe-db-major-engine-versions")) or op == "describe-db-engine-versions":
+    extra = []
+    for k in ("--engine", "--engine-version"):
+        if k in argv: extra += [k, opt(k)]
+    print(json.dumps(sub("patch_mock.py", extra))); sys.exit(0)
+sys.stderr.write("\naws: [ERROR]: mock does not implement: %s %s\n" % (svc, op)); sys.exit(252)
