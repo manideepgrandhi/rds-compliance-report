@@ -19,7 +19,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 LIBDIR="${RDS_CR_LIB:-$SCRIPT_DIR/lib}"
@@ -39,6 +39,7 @@ DAILY_RETENTION_DAYS=""; WEEKLY_RETENTION_DAYS=30; MONTHLY_RETENTION_DAYS=365; R
 LOG_FILE=""; CONFIG_FILE=""; AWS_TIMEOUT=30; MAX_ATTEMPTS=5
 BG_PIDS=(); HAVE_WAIT_N=0; REG_I=0; REG_N=0; REG_T0=0
 KEEP_WORKDIR=0; DRY_RUN=0; VERBOSE=0; SAVE_DATA=0; SAVE_DATA_FILE=""; MERGE=0
+EXC_FILE=""; EXC_JSON="null"; EXC_PATH=""; EXC_ARGS=()   # v1.2.0 compliance exceptions (--merge only)
 WORK=""; NOW=0; STAMP=""; AWS_CALLS=0; AWS_FAILS=0; TZ_OFFSET=0; TZ_LABEL=UTC; CFG=""
 declare -a WRITTEN=() DATA_FILES=()
 
@@ -71,6 +72,9 @@ Options
   --weekly-weekday DAY --monthly-rule first-DAY --tolerance-days N --weekly-window-days N
   --daily-retention-days N --weekly-retention-days N --monthly-retention-days N --retention-tolerance-days N
                           backup thresholds, same meaning and defaults as rds-backup-compliance
+  --exceptions FILE       compliance exceptions, applied at --merge (default: compliance_exceptions.conf next to the
+                          script when present, else off). Lines: account_id | identifier | scope | expires | reason
+                          scope patch, backup or patch,backup; expires YYYY-MM-DD (mandatory). See the .example file
   --prefix P              output file prefix (default rds_compliance_report)
   --tz ZONE               second time zone (default Asia/Kolkata = IST)
   --config FILE           key=value file with any long option above (see conf.example)
@@ -113,7 +117,7 @@ set_opt() {   # set_opt key value  (shared by CLI and --config)
         parallel) int_ok --parallel "$v"; (( v >= 1 )) || die 1 "--parallel must be 1 or more"; PARALLEL="$v" ;;
         output-dir|output_dir) OUTPUT_DIR="$v" ;; log-file|log_file) LOG_FILE="$v" ;;
         prefix) [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || die 1 "--prefix may only use letters, digits, . _ - (got '$v')"; PREFIX="$v" ;;
-        tz) DISPLAY_TZ="$v" ;;
+        tz) DISPLAY_TZ="$v" ;; exceptions) EXC_FILE="$v" ;;
         aws-timeout|aws_timeout) int_ok --aws-timeout "$v"; AWS_TIMEOUT="$v" ;; max-attempts|max_attempts) int_ok --max-attempts "$v"; MAX_ATTEMPTS="$v" ;;
         verbose) is_true "$v" && VERBOSE=1 ;;
         *) return 1 ;;
@@ -149,7 +153,7 @@ parse_args() {
             --keep-workdir) KEEP_WORKDIR=1 ;; --dry-run) DRY_RUN=1 ;; -v|--verbose) VERBOSE=1 ;;
             --save-data) SAVE_DATA=1; if [[ $# -ge 2 && "$2" != -* ]]; then SAVE_DATA_FILE="$2"; shift; fi ;;
             --merge) MERGE=1; while [[ $# -ge 2 && "$2" != -* ]]; do MERGE_ARGS+=("$2"); shift; done ;;
-            --max-behind|--daily|--daily-max-age|--weekly|--monthly|--yearly|--weekly-days|--monthly-days|--daily-retention-days|--weekly-retention-days|--monthly-retention-days|--retention-tolerance-days|--weekly-weekday|--monthly-rule|--tolerance-days|--parallel|--weekly-window-days|--prefix|--tz|--aws-timeout|--max-attempts)
+            --max-behind|--daily|--daily-max-age|--weekly|--monthly|--yearly|--weekly-days|--monthly-days|--daily-retention-days|--weekly-retention-days|--monthly-retention-days|--retention-tolerance-days|--weekly-weekday|--monthly-rule|--tolerance-days|--parallel|--weekly-window-days|--prefix|--tz|--exceptions|--aws-timeout|--max-attempts)
                 need_arg "$1" $#; set_opt "${1#--}" "$2"; shift ;;
             --*=*) local k="${1%%=*}"; set_opt "${k#--}" "${1#*=}" || die 1 "Unknown option: $1" ;;
             *) die 1 "Unknown option: $1 (see --help)" ;;
@@ -528,6 +532,60 @@ abs_dir() {   # absolute, normalised directory (no //, ./, ..; ~ expanded) - Clo
     for part in "${keep[@]}"; do out+="/$part"; done
     printf '%s' "${out:-/}"
 }
+# ---------------------------------------------------------------------------- compliance exceptions (shared by
+# rds-patch-compliance, rds-backup-compliance and rds-compliance-report; same file format in all three)
+# compliance_exceptions.conf, one entry per line:  account_id | identifier | scope | expires | reason
+#   all five required; scope patch, backup or patch,backup; expires YYYY-MM-DD (UTC, last valid day); # comments
+# Strict: any bad line stops the run (exit 1) naming file:line. Applied at report time only (saved data is unchanged).
+exc_trim() { local -n _v="$1"; _v="${_v#"${_v%%[![:space:]]*}"}"; _v="${_v%"${_v##*[![:space:]]}"}"; }
+load_exceptions() {   # -> EXC_JSON: "null" (feature off: no file) or a JSON array of entries; EXC_PATH = the file used
+    local f="$EXC_FILE" line n=0 acct id scope exp reason s y m d dim k tsv=""
+    local -a sc=()
+    local -A seen=()
+    if [[ -z "$f" ]]; then f="$SCRIPT_DIR/compliance_exceptions.conf"; [[ -f "$f" ]] || return 0; fi
+    [[ -f "$f" && -r "$f" ]] || die 1 "Exceptions file not readable: $f"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1)); line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" == *'|'*'|'*'|'*'|'* ]] || die 1 "Exceptions $f:$n: expected 5 fields 'account_id | identifier | scope | expires | reason'"
+        IFS='|' read -r acct id scope exp reason <<<"$line"
+        exc_trim acct; exc_trim id; exc_trim scope; exc_trim exp; reason="${reason//[$'\001'-$'\037']/ }"; exc_trim reason
+        [[ -n "$acct" && -n "$id" && -n "$scope" && -n "$exp" && -n "$reason" ]] \
+            || die 1 "Exceptions $f:$n: missing field (all of account_id, identifier, scope, expires, reason are required)"
+        [[ "$acct" =~ ^[0-9]{12}$ ]] || die 1 "Exceptions $f:$n: account_id must be 12 digits (got '$acct')"
+        [[ "$id" =~ ^[A-Za-z][A-Za-z0-9-]{0,62}$ ]] \
+            || die 1 "Exceptions $f:$n: identifier '$id' is not a DB instance / cluster identifier (letters, digits, hyphens; no wildcards)"
+        scope="${scope,,}"; scope="${scope//[[:space:]]/}"; IFS=',' read -r -a sc <<<"$scope"
+        (( ${#sc[@]} )) || die 1 "Exceptions $f:$n: scope must be patch, backup or patch,backup"
+        k=""; for s in "${sc[@]}"; do
+            [[ "$s" == patch || "$s" == backup ]] || die 1 "Exceptions $f:$n: scope must be patch, backup or patch,backup (got '$scope')"
+            [[ ",$k," == *",$s,"* ]] && die 1 "Exceptions $f:$n: scope lists '$s' twice"
+            k+="${k:+,}$s"
+        done
+        scope="$k"
+        [[ "$exp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] || die 1 "Exceptions $f:$n: expires must be a date YYYY-MM-DD (got '$exp'); an expiry date is mandatory"
+        y=$((10#${BASH_REMATCH[1]})); m=$((10#${BASH_REMATCH[2]})); d=$((10#${BASH_REMATCH[3]}))
+        case "$m" in 1|3|5|7|8|10|12) dim=31 ;; 4|6|9|11) dim=30 ;;
+            2) if (( (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 )); then dim=29; else dim=28; fi ;; *) dim=0 ;; esac
+        (( m >= 1 && m <= 12 && d >= 1 && d <= dim && y >= 2000 )) || die 1 "Exceptions $f:$n: expires '$exp' is not a valid date"
+        for s in "${sc[@]}"; do
+            k="$acct|${id,,}|$s"
+            [[ -n "${seen[$k]:-}" ]] && die 1 "Exceptions $f:$n: duplicate entry for $acct $id ($s), already on line ${seen[$k]}"
+            seen[$k]=$n
+        done
+        tsv+="$n"$'\t'"$acct"$'\t'"$id"$'\t'"$scope"$'\t'"$exp"$'\t'"$reason"$'\n'
+    done <"$f"
+    EXC_PATH="$f"
+    EXC_JSON="$(printf '%s' "$tsv" | jq -Rcs 'split("\n") | map(select(. != "") | split("\t")
+        | {line: (.[0] | tonumber), account: .[1], identifier: .[2], scopes: (.[3] | split(",")), expires: .[4], reason: (.[5:] | join(" "))})' | tr -d '\r')" \
+        || die 1 "Exceptions $f: cannot convert the entries (jq)"
+    return 0
+}
+exc_ready() {   # write the validated entries next to the work files once; jq reads them as $ARGS.named.exc
+    [[ "$EXC_JSON" != null && -n "$WORK" ]] || return 0
+    printf '%s' "$EXC_JSON" >"$WORK/exceptions.json"; EXC_ARGS=(--slurpfile exc "$WORK/exceptions.json"); return 0
+}
+
 output_block() {
     (( ${#WRITTEN[@]} )) || return 0
     local f n=${#WRITTEN[@]}
@@ -538,7 +596,7 @@ output_block() {
 render() {   # render <mode> -> stdout
     jqv -nr --arg mode "$1" --slurpfile P "$WORK/patch.json" --slurpfile B "$WORK/brows.json" --slurpfile BD "$WORK/backup.json" --slurpfile DD "$WORK/docdb.json" \
         --argjson now "$NOW" --argjson cfg "$CFG" --arg tool "$SCRIPT_VERSION" --rawfile page "$LIBDIR/page.js" --rawfile page_css "$LIBDIR/page.css" \
-        -f "$LIBDIR/report.jq"
+        "${EXC_ARGS[@]}" -f "$LIBDIR/report.jq"
 }
 write_out() { local f="$1"; shift; "$@" >"$f" || die 4 "Cannot write $f"; WRITTEN+=("$f"); }
 
@@ -549,6 +607,10 @@ main() {
     local f; for f in backup.jq backup_merge.jq backup_collect.jq patch_merge.jq patch_compliance.jq versions.jq collect_docdb.jq report.jq page.js page.css; do
         [[ -r "$LIBDIR/$f" ]] || die 2 "Missing $LIBDIR/$f - keep the lib/ folder next to the script"; done
     (( MERGE )) || (( DRY_RUN )) || command -v aws >/dev/null 2>&1 || die 2 "aws CLI not found"
+    if (( MERGE )); then   # exceptions are applied when the report is built; the saved data never changes
+        load_exceptions
+        [[ "$EXC_JSON" != null ]] && log_info "Exceptions file $EXC_PATH: $(jqv -r 'length' <<<"$EXC_JSON") entries"
+    elif [[ -n "$EXC_FILE" ]]; then log_warn "--exceptions is used with --merge (report time); ignored for --save-data"; fi
     NOW="${RDS_CR_NOW:-$(date -u +%s)}"; STAMP="$(date -u -d "@$NOW" +%Y%m%d_%H%M%S 2>/dev/null || date -u +%Y%m%d_%H%M%S)"; tz_setup; CFG="$(cfg_json)"
     WORK="$(mktemp -d "${TMPDIR:-/tmp}/rds_cr.XXXXXX")"
     trap '(( KEEP_WORKDIR )) && echo "workdir kept: $WORK" >&2 || rm -rf -- "$WORK"' EXIT
@@ -573,6 +635,7 @@ main() {
         output_block; exit 0
     fi
 
+    exc_ready
     collect_merge_inputs
     local na tag base
     na="$(render json | jqv '.accounts | length')"
@@ -587,6 +650,9 @@ main() {
     render txt >&2
     log_info "AWS calls: 0 (offline merge)"
     log_info "$(render sum)"
+    if [[ "$EXC_JSON" != null ]]; then
+        local l; while IFS=$'\t' read -r f l; do [[ -n "$l" ]] && if [[ "$f" == W ]]; then log_warn "$l"; else log_info "$l"; fi; done < <(render exclog | sed "s|@FILE@|${EXC_PATH##*/}|")
+    fi
     output_block
     exit 0
 }
