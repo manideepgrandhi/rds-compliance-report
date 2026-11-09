@@ -140,6 +140,7 @@ cat >"$EX/ok.conf" <<'CONF'
 222222222222 | dev-docdb | backup | 2026-12-31 | Dev DocumentDB, no backups needed
 111111111111 | ghost-db | patch | 2027-01-01 | Not there
 222222222222 | inv-mysql | patch | 2027-01-01 | Only in account 222
+111111111111 | cms-aurora-mysql | backup | 2027-01-01 | Migration freeze (no backup data for this server)
 CONF
 PATH="$T/fakeaws:$PATH" run --merge "$HERE/fixtures" -o "$EX/on" --exceptions "$EX/ok.conf"
 ok "exc: merge exit 0, 0 aws calls" '[[ $(rc) == 0 && ! -e "$T/awscalls" ]]'
@@ -152,9 +153,12 @@ ok "exc: Warning -> no longer needed, case-insensitive id + scope, | in reason" 
 ok "exc: expired = evaluated normally, formula guard" '[[ $(col "$XV" hr-sql 111111111111 6) == Non-compliant && $(col "$XV" hr-sql 111111111111 13) == expired && $(col "$XV" hr-sql 111111111111 14) == "'"'"'=Expired waiver" && $(col "$XV" hr-sql 111111111111 16) == "exception expired" ]]'
 ok "exc: scope per account (inv-mysql 222 only)" '[[ $(col "$XV" inv-mysql 222222222222 6) == "Compliant (exception)" && $(col "$XV" inv-mysql 111111111111 6) == Non-compliant && $(col "$XV" inv-mysql 111111111111 13) == no ]]'
 ok "exc: patch scope does not touch backup (legacy-aurora-pg12 backup)" '[[ $(col "$XV" legacy-aurora-pg12 111111111111 18) == no && $(col "$XV" legacy-aurora-pg12 111111111111 11) == "No data" ]]'
+ok "exc: No data + exception = not applied, stays No data" '[[ $(col "$XV" cms-aurora-mysql 111111111111 11) == "No data" && $(col "$XV" cms-aurora-mysql 111111111111 18) == nodata && $(col "$XV" cms-aurora-mysql 111111111111 21) == "no data, not applied" && $(col "$XV" cms-aurora-mysql 111111111111 22) == "No data" ]]'
+ok "exc: backup-only entry leaves patch alone (cms patch)" '[[ $(col "$XV" cms-aurora-mysql 111111111111 6) == Compliant && $(col "$XV" cms-aurora-mysql 111111111111 13) == no ]]'
+ok "exc: no-data entry in txt and log" 'grep -q "cms-aurora-mysql backup until 2027-01-01, actual No data, NOT APPLIED (no backup data)" "$XT" && grep -q "not applied (no data): 1" "$XT" && grep -q "WARN.*(backup) for 111111111111 cms-aurora-mysql not applied: no backup data" "$EX/on.err"'
 ok "exc: docdb backup exception (Fail -> OK)" '[[ $(col "$XV" dev-docdb 222222222222 11) == "Compliant (exception)" && $(col "$XV" dev-docdb 222222222222 22) == Fail ]]'
 ok "exc: accounts csv exception counts" 'tr -d "\r" <"$XA" | grep -q "\"patch_exceptions\",\"backup_exceptions\"$" && tr -d "\r" <"$XA" | grep -q "^\"111111111111\",.*,\"28\",\"69.2\",.*,\"2\",\"2\"$" && tr -d "\r" <"$XA" | grep -q "^\"222222222222\",.*,\"66.7\",.*,\"100\",.*,\"1\",\"1\"$"'
-ok "exc: txt Exceptions section + unmatched" 'grep -q "^Exceptions (3 patch, 3 backup applied; counted as compliant; expiring soon or no longer needed: 2; expired: 1):" "$XT" && grep -q "line 8: 111111111111 ghost-db matched no server" "$XT" && grep -q "hr-sql patch until 2026-11-02, actual Non-compliant, EXPIRED" "$XT"'
+ok "exc: txt Exceptions section + unmatched" 'grep -q "^Exceptions (3 patch, 3 backup applied; counted as compliant; expiring soon or no longer needed: 2; expired: 1; not applied (no data): 1):" "$XT" && grep -q "line 8: 111111111111 ghost-db matched no server" "$XT" && grep -q "hr-sql patch until 2026-11-02, actual Non-compliant, EXPIRED" "$XT"'
 ok "exc: log warnings + summary" 'grep -q "WARN.*ok\.conf:8 (111111111111 ghost-db) matched no server" "$EX/on.err" && grep -q "WARN.*(patch) for 111111111111 hr-sql expired on 2026-11-02" "$EX/on.err" && grep -q "Exceptions (patch): 3 applied (counted as compliant), 1 expiring soon or no longer needed, 1 expired, 1 unmatched" "$EX/on.err" && grep -q "Exceptions (backup): 3 applied" "$EX/on.err"'
 ok "exc: Not OK list excludes excepted servers" '! sed -n "/^Not OK/,/^Exceptions/p" "$XT" | grep -q " reports-pg \| dev-docdb "'
 ok "exc: html escaped, exception data present" '! grep -q "<i>backup</i>" "$XH" && grep -q "\"exc\":{\"patch\"" "$XH"'

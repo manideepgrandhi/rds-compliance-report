@@ -84,7 +84,7 @@ Approved exceptions for servers you know are non-compliant (decommission planned
 * **Expired:** the server is evaluated normally and flagged **exception expired**. The log warns about expired entries and about entries that match no server.
 * **When applied:** only when the report is built. `--save-data` files never change.
 * **Outputs:**
-  * Patch and backup scopes apply independently to each server. A patch exception sets the patch status to Compliant, and a backup exception sets the backup status to OK; both are shown as **Compliant (exception)**. An exception also applies when that source has No data for the server.
+  * Patch and backup scopes apply independently to each server. A patch exception sets the patch status to Compliant, and a backup exception sets the backup status to OK; both are shown as **Compliant (exception)**. An exception is **not** applied when that source has No data for the server. The status stays No data and is not counted as compliant. The Exception column shows a grey "no data, not applied" badge, `*_exception` is `nodata`, and the log warns.
   * Cards: `incl. X exceptions` under Patch and Backup compliance. The pop-up shows Compliant, Non-compliant and "Exceptions expiring soon or no longer needed" (that line only when the count is above 0).
   * HTML: an Exception column and an exceptions quick filter (an exception in either scope). The filter combines with the other filters, and the cards, the account / region / engine tables and Export CSV follow it.
   * `_servers.csv`: the label in `patch_status` / `backup_status`. Ten columns are added at the end: `patch_exception`, `patch_exception_reason`, `patch_exception_expires`, `patch_exception_flag`, `patch_actual_status`, and the same five with a `backup_` prefix.
@@ -104,7 +104,7 @@ Exit codes: 0 ok, 1 usage, 2 pre-check, 3 bad `--merge` input, 4 output error.
 
 ## Changelog
 
-- **1.2.0**: compliance exceptions at `--merge` (`--exceptions FILE` / `compliance_exceptions.conf`, see [Compliance exceptions](#compliance-exceptions-v120)). Patch and backup scopes apply independently. Exception column, quick filter, card pop-ups, CSV columns and an Exceptions section in the text. With no file the outputs are unchanged.
+- **1.2.0**: compliance exceptions at `--merge` (`--exceptions FILE` / `compliance_exceptions.conf`, see [Compliance exceptions](#compliance-exceptions-v120)). Patch and backup scopes apply independently. An entry for a server with No data in that source is not applied: it stays No data, and is shown as "no data, not applied" with a log warning. Exception column, quick filter, card pop-ups, CSV columns and an Exceptions section in the text. With no file the outputs are unchanged.
 
 ## Tests
 

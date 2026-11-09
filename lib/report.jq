@@ -42,7 +42,10 @@ def exc_counts($rows; $scope):
    unmatched: exc_unmatched($scope; $rows)};
 # combined report: patch and backup scopes apply independently to the joined row (only here, after the join: the lib
 # copies of the sibling tools stay identical). An applied exception sets the status to Compliant / OK, keeps *_actual_status.
-def xscope($sc; $st; $ok; $set): exc_eval(exc_find($sc; .account_id; .identifier); $ok) as $v
+# An entry for a server that has "No data" in that source is not applied: the status stays No data (never counted
+# as compliant) and the row is marked exception "nodata" / flag "no data, not applied".
+def xscope($sc; $st; $ok; $set): exc_eval(exc_find($sc; .account_id; .identifier); $ok) as $v0
+  | (if $v0.exception != "no" and .[$st] == "No data" then $v0 + {exception: "nodata", exception_flag: "no data, not applied"} else $v0 end) as $v
   | . + {("\($sc)_exception"): $v.exception, ("\($sc)_exception_reason"): $v.exception_reason, ("\($sc)_exception_expires"): $v.exception_expires,
          ("\($sc)_exception_flag"): $v.exception_flag, ("\($sc)_actual_status"): .[$st]}
   | if $v.exception == "yes" then .[$st] = $set else . end;
@@ -82,8 +85,8 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
      | . + {engine_group: (.engine | egroup)} + prow($p; .account_id; "\(.account_id)|\(.region)") + brow($b; .account_id; .engine; "\(.account_id)|\(.region)") ]
    | sort_by(.account_id, .region, .engine_group, .identifier)) as $S
 | (if exc_on then [ $S[] | xapply ] else $S end) as $S
-| (if exc_on then {patch: (exc_counts([ $S[] | {exception: .patch_exception, exception_flag: .patch_exception_flag} ]; "patch") + {unmatched: exc_unmatched("patch"; $S)}),
-                   backup: (exc_counts([ $S[] | {exception: .backup_exception, exception_flag: .backup_exception_flag} ]; "backup") + {unmatched: exc_unmatched("backup"; $S)})}
+| (if exc_on then {patch: (exc_counts([ $S[] | {exception: .patch_exception, exception_flag: .patch_exception_flag} ]; "patch") + {unmatched: exc_unmatched("patch"; $S), no_data: ([ $S[] | select(.patch_exception == "nodata") ] | length)}),
+                   backup: (exc_counts([ $S[] | {exception: .backup_exception, exception_flag: .backup_exception_flag} ]; "backup") + {unmatched: exc_unmatched("backup"; $S), no_data: ([ $S[] | select(.backup_exception == "nodata") ] | length)})}
    else null end) as $XS
 # percentages exactly as each tool: patch = compliant / servers with patch data (1 decimal, rds-patch-compliance);
 # backup = (OK + Warning) / (servers with backup data - not yet due) (whole %, rds-backup-compliance)
@@ -162,10 +165,11 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
         + "; backup \(.backup_status)" + (if .backup_reason != "" then " (\(.backup_reason))" else "" end) end),
     (if exc_on then "", "Exceptions (\($XS.patch.applied) patch, \($XS.backup.applied) backup applied; counted as compliant"
         + (if ($XS.patch.attention + $XS.backup.attention) > 0 then "; expiring soon or no longer needed: \($XS.patch.attention + $XS.backup.attention)" else "" end)
-        + (if ($XS.patch.expired + $XS.backup.expired) > 0 then "; expired: \($XS.patch.expired + $XS.backup.expired)" else "" end) + "):",
+        + (if ($XS.patch.expired + $XS.backup.expired) > 0 then "; expired: \($XS.patch.expired + $XS.backup.expired)" else "" end)
+        + (if ($XS.patch.no_data + $XS.backup.no_data) > 0 then "; not applied (no data): \($XS.patch.no_data + $XS.backup.no_data)" else "" end) + "):",
        ([ $S[] | . as $r | ("patch", "backup") as $sc | select($r["\($sc)_exception"] != "no")
           | "  \($r.account_id) \($r.identifier) \($sc) until \($r["\($sc)_exception_expires"]), actual \($r["\($sc)_actual_status"])"
-            + (if $r["\($sc)_exception"] == "expired" then ", EXPIRED (evaluated normally)" elif $r["\($sc)_exception_flag"] != "" then " [\($r["\($sc)_exception_flag"])]" else "" end)
+            + (if $r["\($sc)_exception"] == "expired" then ", EXPIRED (evaluated normally)" elif $r["\($sc)_exception"] == "nodata" then ", NOT APPLIED (no \($sc) data)" elif $r["\($sc)_exception_flag"] != "" then " [\($r["\($sc)_exception_flag"])]" else "" end)
             + ": \($r["\($sc)_exception_reason"])" ] | if length == 0 then "  none applied" else .[] end),
        ([ $XS.patch.unmatched[], $XS.backup.unmatched[] ] | unique_by(.line)[] | "  line \(.line): \(.account) \(.identifier) matched no server")
      else empty end)
@@ -174,7 +178,9 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
       ([ $XS.patch.unmatched[], $XS.backup.unmatched[] ] | unique_by(.line)[] | "W\tException @FILE@:\(.line) (\(.account) \(.identifier)) matched no server in this report"),
       ($S[] | . as $r | ("patch", "backup") as $sc | select($r["\($sc)_exception"] == "expired")
         | "W\tException (\($sc)) for \($r.account_id) \($r.identifier) expired on \($r["\($sc)_exception_expires"]): evaluated normally (\($r["\($sc)_actual_status"]))"),
-      ("patch", "backup" | . as $sc | $XS[$sc] | "I\tExceptions (\($sc)): \(.applied) applied (counted as compliant), \(.attention) expiring soon or no longer needed, \(.expired) expired, \(.unmatched | length) unmatched")
+      ($S[] | . as $r | ("patch", "backup") as $sc | select($r["\($sc)_exception"] == "nodata")
+        | "W\tException (\($sc)) for \($r.account_id) \($r.identifier) not applied: no \($sc) data for this server (stays No data)"),
+      ("patch", "backup" | . as $sc | $XS[$sc] | "I\tExceptions (\($sc)): \(.applied) applied (counted as compliant), \(.attention) expiring soon or no longer needed, \(.expired) expired, \(.unmatched | length) unmatched\(if .no_data > 0 then ", \(.no_data) not applied (no data)" else "" end)")
     else empty end
   elif $mode == "html" then
     ({generated: "\($now | utc) / \($now | loc)", tool: $tool, tz: $cfg.tz_label,
