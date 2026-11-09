@@ -2,3 +2,4 @@ reports/
 *.html
 *.csv
 !tests/fixtures/*
+whats-new/dist/

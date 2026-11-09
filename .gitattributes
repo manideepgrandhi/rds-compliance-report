@@ -1,0 +1,7 @@
+docs/ export-ignore
+samples/ export-ignore
+tests/ export-ignore
+.github/ export-ignore
+.gitattributes export-ignore
+whats-new/ export-ignore
+CHANGELOG.md export-ignore

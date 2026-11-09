@@ -1,5 +1,7 @@
 # rds-compliance-report
 
+Release history: [What's new](https://manideepgrandhi.github.io/rds-compliance-report/) · also in [CHANGELOG.md](CHANGELOG.md).
+
 One offline HTML report of **patch** and **backup** compliance for AWS RDS, Aurora, Multi-AZ DB clusters, DocumentDB and Neptune, per account, region, engine and server.
 **One script, two steps:** `--save-data` scans each account once (read-only) and writes one file; `--merge` builds the report from those files with 0 AWS calls.
 The rules are the ones in [rds-patch-compliance](https://github.com/manideepgrandhi/rds-patch-compliance) and
