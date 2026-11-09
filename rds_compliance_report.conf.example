@@ -26,6 +26,9 @@
 # weekly-retention-days=30
 # monthly-retention-days=365
 # retention-tolerance-days=1
+# Compliance exceptions (v1.2.0, applied at --merge; see compliance_exceptions.conf.example). Default: compliance_exceptions.conf
+# next to the script when present, else off.
+# exceptions = ./compliance_exceptions.conf
 # --- output
 # output-dir=./reports
 # prefix=rds_compliance_report

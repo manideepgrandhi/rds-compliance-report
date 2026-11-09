@@ -13,6 +13,43 @@ def egroup: if . == null then "Unknown"
   elif . == "docdb" then "DocumentDB" elif . == "neptune" then "Neptune" else . end;
 def dn: test("^(docdb|neptune)");
 def pmap: {"COMPLIANT": "Compliant", "NON-COMPLIANT": "Non-compliant", "UNKNOWN": "Unknown"}[.] // "Unknown";
+# ------------------------------------------------------------------ compliance exceptions (v1.6.0)
+# $ARGS.named.exc = [null] or absent: feature off; [[entries]]: compliance_exceptions.conf entries (validated by the script).
+# An unexpired entry for the scope makes the server compliant (actual_status keeps the evaluated one); expires = last valid
+# UTC day; within 14 days -> "expiring soon"; actual already compliant -> "no longer needed"; past expiry -> normal status.
+def exc_list: (($ARGS.named.exc // [null])[0]);
+def exc_on: exc_list != null;
+def exc_left($d): (($d + "T00:00:00Z" | fromdateiso8601) / 86400 | floor) - ($now | floor / 86400 | floor);
+def exc_find($scope; $acct; $id): ($id | ascii_downcase) as $i
+  | [ exc_list[]? | select(.account == $acct and (.identifier | ascii_downcase) == $i and ((.scopes | index([$scope])) != null)) ] | .[0];
+def exc_eval($e; $ok):
+  if $e == null then {exception: "no", exception_reason: "", exception_expires: "", exception_flag: ""}
+  else exc_left($e.expires) as $d
+  | {exception: (if $d < 0 then "expired" else "yes" end), exception_reason: $e.reason, exception_expires: $e.expires,
+     exception_flag: (if $d < 0 then "exception expired"
+                      else [ (if $ok then "no longer needed" else empty end), (if $d <= 14 then "expiring soon" else empty end) ] | join(", ") end)} end;
+def exc_unmatched($scope; $rows):
+  [ exc_list[]? | select((.scopes | index([$scope])) != null) | . as $e | ($e.identifier | ascii_downcase) as $i
+    | select([ $rows[] | select(.account_id == $e.account and (.identifier | ascii_downcase) == $i) ] | length == 0)
+    | {line, account, identifier} ];
+def exc_counts($rows; $scope):
+  {entries: ([ exc_list[]? | select((.scopes | index([$scope])) != null) ] | length),
+   applied: ([ $rows[] | select(.exception == "yes") ] | length),
+   attention: ([ $rows[] | select(.exception == "yes" and .exception_flag != "") ] | length),
+   expiring_soon: ([ $rows[] | select(.exception == "yes" and (.exception_flag | contains("expiring soon"))) ] | length),
+   no_longer_needed: ([ $rows[] | select(.exception == "yes" and (.exception_flag | contains("no longer needed"))) ] | length),
+   expired: ([ $rows[] | select(.exception == "expired") ] | length),
+   unmatched: exc_unmatched($scope; $rows)};
+# combined report: patch and backup scopes apply independently to the joined row (only here, after the join: the lib
+# copies of the sibling tools stay identical). An applied exception sets the status to Compliant / OK, keeps *_actual_status.
+def xscope($sc; $st; $ok; $set): exc_eval(exc_find($sc; .account_id; .identifier); $ok) as $v
+  | . + {("\($sc)_exception"): $v.exception, ("\($sc)_exception_reason"): $v.exception_reason, ("\($sc)_exception_expires"): $v.exception_expires,
+         ("\($sc)_exception_flag"): $v.exception_flag, ("\($sc)_actual_status"): .[$st]}
+  | if $v.exception == "yes" then .[$st] = $set else . end;
+def xapply: xscope("patch"; "patch_status"; .patch_status == "Compliant"; "Compliant")
+  | xscope("backup"; "backup_status"; (.backup_status == "OK" or .backup_status == "Warning"); "OK");
+def xlabel($sc; $st): if .["\($sc)_exception"] == "yes" then "Compliant (exception)" else .[$st] end;
+def xcols: if exc_on then [ ("patch", "backup") as $sc | "\($sc)_exception", "\($sc)_exception_reason", "\($sc)_exception_expires", "\($sc)_exception_flag", "\($sc)_actual_status" ] else [] end;
 $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
 | ([ $P.errors[]? | "\(.account)|\(.region)" ] | unique) as $PE
 | ([ ($BD[0].regions + $DD[0].regions)[] | select(.status == "error") | "\(.account)|\(.region)" ] | unique) as $BE
@@ -44,6 +81,10 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
         type: ($p.resource_type // ($b.type | if . == "cluster" then "cluster" else "instance" end))}
      | . + {engine_group: (.engine | egroup)} + prow($p; .account_id; "\(.account_id)|\(.region)") + brow($b; .account_id; .engine; "\(.account_id)|\(.region)") ]
    | sort_by(.account_id, .region, .engine_group, .identifier)) as $S
+| (if exc_on then [ $S[] | xapply ] else $S end) as $S
+| (if exc_on then {patch: (exc_counts([ $S[] | {exception: .patch_exception, exception_flag: .patch_exception_flag} ]; "patch") + {unmatched: exc_unmatched("patch"; $S)}),
+                   backup: (exc_counts([ $S[] | {exception: .backup_exception, exception_flag: .backup_exception_flag} ]; "backup") + {unmatched: exc_unmatched("backup"; $S)})}
+   else null end) as $XS
 # percentages exactly as each tool: patch = compliant / servers with patch data (1 decimal, rds-patch-compliance);
 # backup = (OK + Warning) / (servers with backup data - not yet due) (whole %, rds-backup-compliance)
 | def tot: {servers: length,
@@ -53,6 +94,7 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
       backup_ok: (map(select(.backup_status == "OK")) | length), backup_warn: (map(select(.backup_status == "Warning")) | length),
       backup_fail: (map(select(.backup_status == "Fail")) | length), backup_unknown: (map(select(.backup_status == "Unknown")) | length),
       backup_nyd: (map(select(.backup_status == "Not yet due")) | length), backup_nodata: (map(select(.backup_status == "No data")) | length)}
+    + (if exc_on then {patch_exc: (map(select(.patch_exception == "yes")) | length), backup_exc: (map(select(.backup_exception == "yes")) | length)} else {} end)
     | . + {patch_pct: (if .patch_data == 0 then null else ((.patch_ok * 1000 / .patch_data | round) / 10) end),
            backup_due: (.servers - .backup_nodata - .backup_nyd)}
     | . + {backup_pct: (if .backup_due == 0 then null else (100 * (.backup_ok + .backup_warn) / .backup_due | round) end)};
@@ -68,17 +110,20 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
 | ($S | grp(.account_id + "|" + .region)) as $RG
 | ($S | grp(.engine_group)) as $EG
 | def srowcols: ["account_id","region","engine","engine_group","type","identifier","patch_status","current_version","latest_version",
-                 "versions_behind","patch_note","backup_status","backup_reason"];
+                 "versions_behind","patch_note","backup_status","backup_reason"] + xcols;
   def csvrow: map(if . == null then "" elif type == "string" then (if test("^[=+@\\-\t\r]") then "'" + . else . end
                    | if test("^[0-9]+(\\.[0-9]+)+$") then "=\"" + . + "\"" else . end) else tostring end) | @csv;
-  def scsv($r): [$r.account_id, $r.region, $r.engine, $r.engine_group, $r.type, $r.identifier, $r.patch_status, $r.current_version,
-                 $r.latest_version, $r.versions_behind, $r.patch_reason, $r.backup_status, $r.backup_reason];
+  def scsv($r): [$r.account_id, $r.region, $r.engine, $r.engine_group, $r.type, $r.identifier, ($r | xlabel("patch"; "patch_status")), $r.current_version,
+                 $r.latest_version, $r.versions_behind, $r.patch_reason, ($r | xlabel("backup"; "backup_status")), $r.backup_reason] + [ xcols[] as $c | $r[$c] ];
   def tcols: ["servers","patch_pct","patch_compliant","patch_non_compliant","patch_unknown","patch_no_data",
-              "backup_pct","backup_ok","backup_warning","backup_fail","backup_unknown","backup_not_yet_due","backup_no_data"];
+              "backup_pct","backup_ok","backup_warning","backup_fail","backup_unknown","backup_not_yet_due","backup_no_data"]
+              + (if exc_on then ["patch_exceptions","backup_exceptions"] else [] end);
   def tvals($t): [$t.servers, $t.patch_pct, $t.patch_ok, $t.patch_fail, $t.patch_unknown, $t.patch_nodata,
-                  $t.backup_pct, $t.backup_ok, $t.backup_warn, $t.backup_fail, $t.backup_unknown, $t.backup_nyd, $t.backup_nodata];
-  def ttxt($t): "patch \($t.patch_pct | pcts) (\($t.patch_ok) of \($t.patch_data)\(if $t.patch_nodata > 0 then ", \($t.patch_nodata) no data" else "" end))"
-     + " | backup \($t.backup_pct | pcts) (\($t.backup_ok + $t.backup_warn) of \($t.backup_due)\(if $t.backup_warn > 0 then ", \($t.backup_warn) warning" else "" end)"
+                  $t.backup_pct, $t.backup_ok, $t.backup_warn, $t.backup_fail, $t.backup_unknown, $t.backup_nyd, $t.backup_nodata]
+                 + (if exc_on then [$t.patch_exc, $t.backup_exc] else [] end);
+  def xinc($n): if ($n // 0) > 0 then ", incl. \($n) exception\(if $n == 1 then "" else "s" end)" else "" end;
+  def ttxt($t): "patch \($t.patch_pct | pcts) (\($t.patch_ok) of \($t.patch_data)\(xinc($t.patch_exc))\(if $t.patch_nodata > 0 then ", \($t.patch_nodata) no data" else "" end))"
+     + " | backup \($t.backup_pct | pcts) (\($t.backup_ok + $t.backup_warn) of \($t.backup_due)\(xinc($t.backup_exc))\(if $t.backup_warn > 0 then ", \($t.backup_warn) warning" else "" end)"
      + "\(if $t.backup_nyd > 0 then ", \($t.backup_nyd) not yet due" else "" end)\(if $t.backup_nodata > 0 then ", \($t.backup_nodata) no data" else "" end))";
   def pad($n): tostring | if length >= $n then . else . + (" " * ($n - length)) end;
   def colt($e): if $e == null then "-" else "\($e | utc) / \($e | loc)" end;
@@ -90,7 +135,7 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
   elif $mode == "rcsv" then (["account_id","region"] + tcols | csvrow), ($RG[] | (.k | split("|")) + tvals(.t) | csvrow)
   elif $mode == "ecsv" then (["engine"] + tcols | csvrow), ($EG[] | [.k] + tvals(.t) | csvrow)
   elif $mode == "json" then {tool: "rds_compliance_report", version: $tool, generated_utc: ($now | utc), generated_local: ($now | loc), totals: $T,
-                             accounts: $AC, regions: $RG, engines: $EG, servers: $S}
+                             accounts: $AC, regions: $RG, engines: $EG, servers: $S} + (if exc_on then {exceptions: $XS} else {} end)
   elif $mode == "sum" then "\($S | length) server(s): " + ttxt($T)
   elif $mode == "txt" then
     "RDS compliance report v\($tool) - generated \($now | utc) / \($now | loc)",
@@ -114,7 +159,23 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
      | if length == 0 then "  none" else .[] | "  \(.account_id) \(.region) \(.identifier) [\(.engine_group)]: patch \(.patch_status)"
         + (if .versions_behind != null then " (\(.current_version) -> \(.latest_version), \(.versions_behind) behind)" else "" end)
         + (if .patch_reason != "" then " [\(.patch_reason)]" else "" end)
-        + "; backup \(.backup_status)" + (if .backup_reason != "" then " (\(.backup_reason))" else "" end) end)
+        + "; backup \(.backup_status)" + (if .backup_reason != "" then " (\(.backup_reason))" else "" end) end),
+    (if exc_on then "", "Exceptions (\($XS.patch.applied) patch, \($XS.backup.applied) backup applied; counted as compliant"
+        + (if ($XS.patch.attention + $XS.backup.attention) > 0 then "; expiring soon or no longer needed: \($XS.patch.attention + $XS.backup.attention)" else "" end)
+        + (if ($XS.patch.expired + $XS.backup.expired) > 0 then "; expired: \($XS.patch.expired + $XS.backup.expired)" else "" end) + "):",
+       ([ $S[] | . as $r | ("patch", "backup") as $sc | select($r["\($sc)_exception"] != "no")
+          | "  \($r.account_id) \($r.identifier) \($sc) until \($r["\($sc)_exception_expires"]), actual \($r["\($sc)_actual_status"])"
+            + (if $r["\($sc)_exception"] == "expired" then ", EXPIRED (evaluated normally)" elif $r["\($sc)_exception_flag"] != "" then " [\($r["\($sc)_exception_flag"])]" else "" end)
+            + ": \($r["\($sc)_exception_reason"])" ] | if length == 0 then "  none applied" else .[] end),
+       ([ $XS.patch.unmatched[], $XS.backup.unmatched[] ] | unique_by(.line)[] | "  line \(.line): \(.account) \(.identifier) matched no server")
+     else empty end)
+  elif $mode == "exclog" then   # script log lines (tab: W = warning, I = info); @FILE@ = exceptions file name
+    if exc_on then
+      ([ $XS.patch.unmatched[], $XS.backup.unmatched[] ] | unique_by(.line)[] | "W\tException @FILE@:\(.line) (\(.account) \(.identifier)) matched no server in this report"),
+      ($S[] | . as $r | ("patch", "backup") as $sc | select($r["\($sc)_exception"] == "expired")
+        | "W\tException (\($sc)) for \($r.account_id) \($r.identifier) expired on \($r["\($sc)_exception_expires"]): evaluated normally (\($r["\($sc)_actual_status"]))"),
+      ("patch", "backup" | . as $sc | $XS[$sc] | "I\tExceptions (\($sc)): \(.applied) applied (counted as compliant), \(.attention) expiring soon or no longer needed, \(.expired) expired, \(.unmatched | length) unmatched")
+    else empty end
   elif $mode == "html" then
     ({generated: "\($now | utc) / \($now | loc)", tool: $tool, tz: $cfg.tz_label,
       rules: {max_behind: $PC.max_behind, oracle_any: $PC.oracle_any_patch_line, daily: $cfg.daily, daily_ret: $cfg.daily_retention_days,
@@ -124,7 +185,7 @@ $P[0] as $P | $B[0] as $B | $BD[0].accounts as $BA | $DD[0].accounts as $DA
                                            b: (.backup_collected | if . == null then null else "\(utc) / \(loc)" end),
                                            d: (.docdb_collected | if . == null then null else "\(utc) / \(loc)" end)} ],
       cols: srowcols, rows: $S, stamp: ($now | todate | gsub("[-:]"; "") | sub("T"; "_") | sub("Z"; "")),
-      acct: (if ($AC | length) == 1 then $AC[0].account_id else "" end)} | tojson
+      acct: (if ($AC | length) == 1 then $AC[0].account_id else "" end)} + (if exc_on then {exc: $XS} else {} end) | tojson
      | gsub("<"; "\\u003c") | gsub(">"; "\\u003e") | gsub("&"; "\\u0026")) as $J
     | "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
       + "<title>RDS compliance report</title><style>" + $page_css + "</style></head><body><div id=\"app\"></div>"

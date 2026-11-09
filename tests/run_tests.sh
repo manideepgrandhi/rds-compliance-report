@@ -13,7 +13,7 @@ run() { "$S" "$@" >"$T/out" 2>"$T/err"; echo $? >"$T/rc"; }
 rc() { cat "$T/rc"; }
 
 echo "== usage"
-run --version; ok "--version" '[[ $(rc) == 0 ]] && grep -q "1.1.0" "$T/out"'
+run --version; ok "--version" '[[ $(rc) == 0 ]] && grep -q "1.2.0" "$T/out"'
 run; ok "no args -> usage, 1" '[[ $(rc) == 1 ]] && grep -q "save-data" "$T/out"'
 run -A; ok "no mode -> 1" '[[ $(rc) == 1 ]]'
 run --merge "$HERE/fixtures"; ok "merge without -o -> 1" '[[ $(rc) == 1 ]]'
@@ -126,6 +126,67 @@ ok "region failure recorded" 'jq -e "[.backup.regions[]?, .patch.region_status[]
 MOCK_SCENARIO=empty PATH="$MPATH" run --save-data -P prod -A -o "$T/c5"; ok "empty account ok" '[[ $(rc) == 0 ]]'
 PATH="$MPATH" run --save-data -P prod -r us-east-1 --dry-run -o "$T/c6"; ok "dry-run exit 0" '[[ $(rc) == 0 ]]'
 PATH="$MPATH" run --save-data -P bogus -r us-east-1 -o "$T/c7"; ok "bad profile -> nonzero, no file" '[[ $(rc) != 0 ]] && ! ls "$T"/c7/*.json >/dev/null 2>&1'
+
+echo "== v1.2.0: compliance exceptions (--exceptions FILE / compliance_exceptions.conf)"
+# RDS_CR_NOW 1793700000 = 2026-11-03 (UTC): expiring soon = within 14 days, expires = last valid day
+EX="$T/exc"; mkdir -p "$EX"
+cat >"$EX/ok.conf" <<'CONF'
+# account_id | identifier | scope | expires | reason
+111111111111 | reports-pg | patch,backup | 2027-01-31 | Vendor freeze (CHG-9)
+111111111111 | legacy-aurora-pg12 | patch | 2026-11-10 | Decommission next week
+
+  111111111111|ORDERS-aurora-pg15|Backup|2027-01-01|Old <i>backup</i> waiver | see CHG-7
+111111111111 | hr-sql | patch | 2026-11-02 | =Expired waiver
+222222222222 | dev-docdb | backup | 2026-12-31 | Dev DocumentDB, no backups needed
+111111111111 | ghost-db | patch | 2027-01-01 | Not there
+222222222222 | inv-mysql | patch | 2027-01-01 | Only in account 222
+CONF
+PATH="$T/fakeaws:$PATH" run --merge "$HERE/fixtures" -o "$EX/on" --exceptions "$EX/ok.conf"
+ok "exc: merge exit 0, 0 aws calls" '[[ $(rc) == 0 && ! -e "$T/awscalls" ]]'
+XV="$(ls "$EX"/on/*_servers.csv)"; XA="$(ls "$EX"/on/*_accounts.csv)"; XT="$(ls "$EX"/on/*.txt)"; XH="$(ls "$EX"/on/*.html)"; cp "$T/err" "$EX/on.err"
+ok "exc: patch 69% (20 of 29, incl. 3), backup 60% (6 of 10, incl. 3)" 'grep -q "^Overall    : 32 server(s), patch 69% (20 of 29, incl. 3 exceptions, 3 no data) | backup 60% (6 of 10, incl. 3 exceptions, 3 not yet due, 19 no data)" "$XT"'
+ok "exc: 32 servers, 23 columns" '[[ $(( $(wc -l <"$XV") - 1 )) == 32 ]] && head -1 "$XV" | tr -d "\r" | grep -q ",\"backup_reason\",\"patch_exception\",\"patch_exception_reason\",\"patch_exception_expires\",\"patch_exception_flag\",\"patch_actual_status\",\"backup_exception\",\"backup_exception_reason\",\"backup_exception_expires\",\"backup_exception_flag\",\"backup_actual_status\"$"'
+ok "exc: reports-pg both scopes, actual kept" '[[ $(col "$XV" reports-pg 111111111111 6) == "Compliant (exception)" && $(col "$XV" reports-pg 111111111111 11) == "Compliant (exception)" && $(col "$XV" reports-pg 111111111111 17) == Non-compliant && $(col "$XV" reports-pg 111111111111 22) == Fail ]]'
+ok "exc: expiring soon (7 days)" '[[ $(col "$XV" legacy-aurora-pg12 111111111111 16) == "expiring soon" && $(col "$XV" legacy-aurora-pg12 111111111111 13) == yes ]]'
+ok "exc: Warning -> no longer needed, case-insensitive id + scope, | in reason" '[[ $(col "$XV" orders-aurora-pg15 111111111111 21) == "no longer needed" && $(col "$XV" orders-aurora-pg15 111111111111 22) == Warning && $(col "$XV" orders-aurora-pg15 111111111111 19) == "Old <i>backup</i> waiver | see CHG-7" ]]'
+ok "exc: expired = evaluated normally, formula guard" '[[ $(col "$XV" hr-sql 111111111111 6) == Non-compliant && $(col "$XV" hr-sql 111111111111 13) == expired && $(col "$XV" hr-sql 111111111111 14) == "'"'"'=Expired waiver" && $(col "$XV" hr-sql 111111111111 16) == "exception expired" ]]'
+ok "exc: scope per account (inv-mysql 222 only)" '[[ $(col "$XV" inv-mysql 222222222222 6) == "Compliant (exception)" && $(col "$XV" inv-mysql 111111111111 6) == Non-compliant && $(col "$XV" inv-mysql 111111111111 13) == no ]]'
+ok "exc: patch scope does not touch backup (legacy-aurora-pg12 backup)" '[[ $(col "$XV" legacy-aurora-pg12 111111111111 18) == no && $(col "$XV" legacy-aurora-pg12 111111111111 11) == "No data" ]]'
+ok "exc: docdb backup exception (Fail -> OK)" '[[ $(col "$XV" dev-docdb 222222222222 11) == "Compliant (exception)" && $(col "$XV" dev-docdb 222222222222 22) == Fail ]]'
+ok "exc: accounts csv exception counts" 'tr -d "\r" <"$XA" | grep -q "\"patch_exceptions\",\"backup_exceptions\"$" && tr -d "\r" <"$XA" | grep -q "^\"111111111111\",.*,\"28\",\"69.2\",.*,\"2\",\"2\"$" && tr -d "\r" <"$XA" | grep -q "^\"222222222222\",.*,\"66.7\",.*,\"100\",.*,\"1\",\"1\"$"'
+ok "exc: txt Exceptions section + unmatched" 'grep -q "^Exceptions (3 patch, 3 backup applied; counted as compliant; expiring soon or no longer needed: 2; expired: 1):" "$XT" && grep -q "line 8: 111111111111 ghost-db matched no server" "$XT" && grep -q "hr-sql patch until 2026-11-02, actual Non-compliant, EXPIRED" "$XT"'
+ok "exc: log warnings + summary" 'grep -q "WARN.*ok\.conf:8 (111111111111 ghost-db) matched no server" "$EX/on.err" && grep -q "WARN.*(patch) for 111111111111 hr-sql expired on 2026-11-02" "$EX/on.err" && grep -q "Exceptions (patch): 3 applied (counted as compliant), 1 expiring soon or no longer needed, 1 expired, 1 unmatched" "$EX/on.err" && grep -q "Exceptions (backup): 3 applied" "$EX/on.err"'
+ok "exc: Not OK list excludes excepted servers" '! sed -n "/^Not OK/,/^Exceptions/p" "$XT" | grep -q " reports-pg \| dev-docdb "'
+ok "exc: html escaped, exception data present" '! grep -q "<i>backup</i>" "$XH" && grep -q "\"exc\":{\"patch\"" "$XH"'
+ok "exc: no-file run has no exception columns" '! head -1 "$SV" | grep -q exception && ! grep -q "\"exc\":" "$H"'
+# validation: strict, file:line, exit 1, before anything is read
+xbad() { printf '# header\n111111111111 | good-db | patch | 2027-01-01 | ok\n%s\n' "$3" >"$EX/$1.conf"; run --merge "$HERE/fixtures" -o "$EX/x_$1" --exceptions "$EX/$1.conf"
+         ok "exc validation $1: exit 1, $1.conf:3: $2" '[[ $(rc) == 1 ]] && grep -q "Exceptions .*'"$1"'\.conf:3: .*'"$2"'" "$T/err" && [[ ! -e "$EX/x_'"$1"'" || -z "$(ls -A "$EX/x_'"$1"'")" ]]'; }
+xbad missing 'missing field' '111111111111 | db1 |  | 2027-01-01 | r'
+xbad fields 'expected 5 fields' '111111111111 | db1 | patch'
+xbad acct 'account_id must be 12 digits' '123 | db1 | patch | 2027-01-01 | r'
+xbad scope 'scope must be patch, backup or patch,backup' '111111111111 | db1 | all | 2027-01-01 | r'
+xbad date 'is not a valid date' '111111111111 | db1 | patch | 2026-13-01 | r'
+xbad date2 'expires must be a date YYYY-MM-DD' '111111111111 | db1 | patch | soon | r'
+xbad glob 'is not a DB instance / cluster identifier' '111111111111 | db% | patch | 2027-01-01 | r'
+xbad dup 'duplicate entry for 111111111111 good-DB (patch), already on line 2' '111111111111 | good-DB | backup,patch | 2027-01-01 | r'
+run --merge "$HERE/fixtures" -o "$EX/x_nofile" --exceptions "$EX/none.conf"; ok "exc: missing file -> 1" '[[ $(rc) == 1 ]] && grep -q "Exceptions file not readable" "$T/err"'
+# default file next to the script (tool copy), config key, --save-data ignores it
+TC="$T/toolcopy"; mkdir -p "$TC"; cp -r "$ROOT/rds_compliance_report.sh" "$ROOT/lib" "$TC/"
+"$TC/rds_compliance_report.sh" --merge "$HERE/fixtures" -o "$EX/def0" >/dev/null 2>&1
+ok "exc default: absent -> off" '! head -1 "$(ls "$EX"/def0/*_servers.csv)" | grep -q exception'
+cp "$EX/ok.conf" "$TC/compliance_exceptions.conf"; "$TC/rds_compliance_report.sh" --merge "$HERE/fixtures" -o "$EX/def1" >/dev/null 2>&1
+ok "exc default: compliance_exceptions.conf next to the script is used" 'grep -q "incl. 3 exceptions" "$(ls "$EX"/def1/*.txt)"'
+printf 'exceptions = %s\n' "$EX/ok.conf" >"$EX/c.conf"; run --config "$EX/c.conf" --merge "$HERE/fixtures" -o "$EX/conf"
+ok "exc: config key exceptions = FILE" '[[ $(rc) == 0 ]] && grep -q "incl. 3 exceptions" "$EX"/conf/*.txt'
+PATH="$MPATH" run --save-data -P prod -r us-east-1 -o "$EX/sd" --exceptions "$EX/ok.conf"
+ok "exc: --save-data warns, file has no exception data" '[[ $(rc) == 0 ]] && grep -q "ignored for --save-data" "$T/err" && ! grep -qi exception "$EX"/sd/*.json'
+if command -v node >/dev/null && [[ -x "${CHROME:-/usr/bin/google-chrome}" ]] && node -e 'require("puppeteer-core")' 2>/dev/null; then
+  res="$(node "$HERE/browser_exceptions.js" "$XH" ${SHOTS:+"$SHOTS/exceptions"} 2>&1)"; brc=$?
+  echo "  $res"; ok "browser: exception column, quick filter with other filters, pop-ups, CSV" '[[ $brc == 0 ]]'
+  res="$(EXPECT='{"servers":32,"patch":"69%","backup":"60%"}' node "$HERE/browser_check.js" "$XH" 2>&1)"; brc=$?
+  [[ $brc == 0 ]] || echo "  $res"; ok "browser: existing checks pass on a report with exceptions" '[[ $brc == 0 ]]'
+else echo "  skip exceptions browser check (node + puppeteer-core on NODE_PATH + Chrome)"; fi
 
 echo "== shellcheck"
 if command -v shellcheck >/dev/null; then ok "shellcheck" 'shellcheck -x "$S" "$HERE/run_tests.sh"'; else echo "  skip shellcheck"; fi
